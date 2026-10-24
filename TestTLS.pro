@@ -42,3 +42,6 @@ FORMS += \
     benchmark.ui \
         widget.ui \
     chatdialog.ui
+
+INCLUDEPATH += "C:/Program Files/OpenSSL-Win64/include"
+LIBS += -L"C:/Program Files/OpenSSL-Win64/lib" -llibssl -llibcrypto

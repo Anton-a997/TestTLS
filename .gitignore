@@ -36,6 +36,8 @@ Makefile*
 target_wrapper.*
 
 # QtCreator
+build
+msvc_make.bat
 *.autosave
 
 # QtCreator Qml

@@ -1,12 +1,6 @@
 #ifndef CRYPTO_H
 #define CRYPTO_H
 
-#pragma comment( lib, "Ws2_32" )
-#pragma comment( lib, "User32" )
-#pragma comment( lib, "Crypt32" )
-#pragma comment( lib, "Advapi32" )
-#pragma comment( lib, "..\\TestTLS\\libssl64MD" )
-#pragma comment( lib, "..\\TestTLS\\libcrypto64MD" )
 
 #include <openssl/err.h>
 #include <openssl/ssl.h>
