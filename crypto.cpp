@@ -32,6 +32,16 @@ FilePtr openFile(const std::string &path, const char *mode)
 constexpr const char *kDefaultSigAlgs = "ecdsa_secp256r1_sha256:rsa_pss_rsae_sha256:ed25519";
 constexpr const char *kKeylogFilePath = "cert/keylog.log";
 
+void printOpenSslErrors()
+{
+    ERR_print_errors_cb(
+        [](const char *str, size_t len, void * /*u*/) -> int {
+            std::fwrite(str, 1, len, stderr);
+            return 1;
+        },
+        nullptr);
+}
+
 } // namespace
 
 // ============================================================================
@@ -113,47 +123,47 @@ int CertificateGenerator::signCertificate(X509 *cert, EVP_PKEY *privateKey, Cert
 
 bool CertificateGenerator::writePrivateKeyPem(EVP_PKEY *pkey, const std::string &path)
 {
-    FilePtr f = openFile(path, "wb");
-    if (!f)
+    BioPtr bio(BIO_new_file(path.c_str(), "wb"));
+    if (!bio)
         return false;
 
-    return PEM_write_PrivateKey(f.get(), pkey, nullptr, nullptr, 0, nullptr, nullptr) != 0;
+    return PEM_write_bio_PrivateKey(bio.get(), pkey, nullptr, nullptr, 0, nullptr, nullptr) != 0;
 }
 
 bool CertificateGenerator::writeCertificatePem(X509 *cert, const std::string &path)
 {
-    FilePtr f = openFile(path, "wb");
-    if (!f)
+    BioPtr bio(BIO_new_file(path.c_str(), "wb"));
+    if (!bio)
         return false;
 
-    return PEM_write_X509(f.get(), cert) != 0;
+    return PEM_write_bio_X509(bio.get(), cert) != 0;
 }
 
 bool CertificateGenerator::writeCsrPem(X509_REQ *req, const std::string &path)
 {
-    FilePtr f = openFile(path, "wb");
-    if (!f)
+    BioPtr bio(BIO_new_file(path.c_str(), "wb"));
+    if (!bio)
         return false;
 
-    return PEM_write_X509_REQ(f.get(), req) != 0;
+    return PEM_write_bio_X509_REQ(bio.get(), req) != 0;
 }
 
 X509Ptr CertificateGenerator::loadCertificate(const std::string &certPath)
 {
-    FilePtr f = openFile(certPath, "r");
-    if (!f)
+    BioPtr bio(BIO_new_file(certPath.c_str(), "rb"));
+    if (!bio)
         return nullptr;
 
-    return X509Ptr(PEM_read_X509(f.get(), nullptr, nullptr, nullptr));
+    return X509Ptr(PEM_read_bio_X509(bio.get(), nullptr, nullptr, nullptr));
 }
 
 EvpPkeyPtr CertificateGenerator::loadPrivateKey(const std::string &keyPath)
 {
-    FilePtr f = openFile(keyPath, "r");
-    if (!f)
+    BioPtr bio(BIO_new_file(keyPath.c_str(), "rb"));
+    if (!bio)
         return nullptr;
 
-    return EvpPkeyPtr(PEM_read_PrivateKey(f.get(), nullptr, nullptr, nullptr));
+    return EvpPkeyPtr(PEM_read_bio_PrivateKey(bio.get(), nullptr, nullptr, nullptr));
 }
 
 EvpPkeyPtr CertificateGenerator::extractPublicKey(X509 *cert)
@@ -423,13 +433,13 @@ bool TlsContext::loadCertificateAndKey(const std::string &certPath, const std::s
 
     if (SSL_CTX_use_certificate_file(m_ctx.get(), certPath.c_str(), SSL_FILETYPE_PEM) <= 0)
     {
-        ERR_print_errors_fp(stderr);
+        printOpenSslErrors();
         return false;
     }
 
     if (SSL_CTX_use_PrivateKey_file(m_ctx.get(), keyPath.c_str(), SSL_FILETYPE_PEM) <= 0)
     {
-        ERR_print_errors_fp(stderr);
+        printOpenSslErrors();
         return false;
     }
 
