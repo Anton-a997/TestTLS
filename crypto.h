@@ -5,6 +5,7 @@
 #include <openssl/err.h>
 #include <openssl/ssl.h>
 #include <openssl/ec.h>
+#include <openssl/x509v3.h>
 
 #define CERT_RSA 1
 #define CERT_ECDSA 2
