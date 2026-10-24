@@ -7,263 +7,16 @@
 #include <numeric>
 
 #include <QDir>
+#include <QMetaType>
 
 using namespace std::chrono;
 
-Benchmark::Benchmark(QWidget *parent) :
-    QWidget(parent),
-    ui(new Ui::Benchmark)
+namespace {
+
+void removeBenchTempFiles()
 {
-    ui->setupUi(this);
-
-    ResetTable();
-}
-
-Benchmark::~Benchmark()
-{
-    delete ui;
-}
-
-void Benchmark::closeEvent(QCloseEvent *event)
-{
-    emit Closed();
-    event->accept();
-}
-
-void Benchmark::ResetTable()
-{
-    for (int i = 0; i < ui->tableWidget->rowCount(); i++)
-    {
-        for (int j = 0; j < ui->tableWidget->columnCount(); j++)
-        {
-            ui->tableWidget->setItem(i, j, new QTableWidgetItem("0"));
-        }
-    }
-
-    ui->spinBox->setValue(CERT_SIGN_ATTEMPTS);
-    ui->spinBox_2->setValue(HANDSHAKE_ATTEMPTS);
-    ui->spinBox_3->setValue(MESSAGES_TO_SEND);
-    ui->lineEdit_4->setText("0");
-    ui->progressBar->setValue(0);
-}
-
-void Benchmark::StartBench()
-{
-    const char *alg_string = "";
-
-    if (ui->radioButton->isChecked())
-        alg_string = "TLS_AES_256_GCM_SHA384";
-    else if (ui->radioButton_2->isChecked())
-        alg_string = "TLS_CHACHA20_POLY1305_SHA256";
-    else if (ui->radioButton_3->isChecked())
-        alg_string = "TLS_AES_128_GCM_SHA256";
-
-    CertAlgorithm cert_alg = CertAlgorithm::Rsa;
-
-    if (ui->radioButton_5->isChecked())
-        cert_alg = CertAlgorithm::Rsa;
-    else if (ui->radioButton_4->isChecked())
-        cert_alg = CertAlgorithm::Ecdsa;
-    else if (ui->radioButton_6->isChecked())
-        cert_alg = CertAlgorithm::Ed25519;
-
-    int totalActions = CERT_SIGN_ATTEMPTS * 2 + HANDSHAKE_ATTEMPTS + MESSAGE_EXCHANGE_SESSIONS;
-    int performed = 0;
-
-    QDir().mkpath("cert");
-
-    // 1 - Скорость создания и проверки подписи
-    const std::string caCertPath = "cert/test-ca-cert.pem";
-    const std::string caKeyPath = "cert/test-ca-key.pem";
-
-    if (!CertificateGenerator::generateCaCertificate(cert_alg, caCertPath, caKeyPath))
-    {
-        QMessageBox::critical(this, "Ошибка", "Не удалось создать сертификат ЦС");
-        return;
-    }
-
-    X509ReqPtr x509req = CertificateGenerator::createServerCsr(cert_alg);
-    if (!x509req)
-    {
-        QMessageBox::critical(this, "Ошибка", "Не удалось создать сертификат запроса");
-        return;
-    }
-
-    X509Ptr caCert = CertificateGenerator::loadCertificate(caCertPath);
-    EvpPkeyPtr caPublicKey = CertificateGenerator::extractPublicKey(caCert.get());
-    EvpPkeyPtr caPrivateKey = CertificateGenerator::loadPrivateKey(caKeyPath);
-
-    if (!caCert || !caPublicKey || !caPrivateKey)
-    {
-        QMessageBox::critical(this, "Ошибка", "Не удалось открыть сертификат или ключ ЦС");
-        return;
-    }
-
-    QList<long long> cert_sign_measurements, cert_verify_measurements;
-    long long time_sign_microsec = 0;
-    long long time_verify_microsec = 0;
-
-    int cert_sign_succeeded = CERT_SIGN_ATTEMPTS;
-    int cert_verify_succeeded = CERT_SIGN_ATTEMPTS;
-
-    for (int i = 0; i < CERT_SIGN_ATTEMPTS; i++)
-    {
-        if (!CertificateGenerator::benchmarkSignAndVerify(
-                x509req.get(),
-                cert_alg,
-                caCert.get(),
-                caPublicKey.get(),
-                caPrivateKey.get(),
-                time_sign_microsec,
-                time_verify_microsec))
-        {
-            --cert_sign_succeeded;
-        }
-        else
-        {
-            cert_sign_measurements << time_sign_microsec;
-        }
-
-        if (time_verify_microsec == 0)
-            --cert_verify_succeeded;
-        else
-            cert_verify_measurements << time_verify_microsec;
-
-        performed += 2;
-        ui->progressBar->setValue(100 * performed / totalActions);
-    }
-
-    std::remove(caCertPath.c_str());
-    std::remove(caKeyPath.c_str());
-
-    ui->spinBox->setValue(cert_sign_succeeded);
-
-    QList<long long> cert_sign_statistics = GetStatistics(cert_sign_measurements);
-    QList<long long> cert_verify_statistics = GetStatistics(cert_verify_measurements);
-
-    for (int i = 0; i < 6; i++)
-    {
-        ui->tableWidget->setItem(0, i, new QTableWidgetItem(QString::number(static_cast<double>(cert_sign_statistics[i]) / 1000.0)));
-        ui->tableWidget->setItem(1, i, new QTableWidgetItem(QString::number(static_cast<double>(cert_verify_statistics[i]) / 1000.0)));
-    }
-
-    // 2 - скорость установления хендшейка и обмена
-    if (!CertificateGenerator::generateServerCertificateChain(
-            cert_alg,
-            "cert/bench-ca-cert.pem",
-            "cert/bench-ca-key.pem",
-            "cert/bench-server-req.pem",
-            "cert/bench-server-key.pem",
-            "cert/bench-server-cert.pem"))
-    {
-        QMessageBox::critical(this, "Ошибка", "Не удалось создать сертификат серверу!");
-        return;
-    }
-
-    std::unique_ptr<TlsContext> ssl_server_ctx = TlsContext::createServerContext(alg_string);
-    if (!ssl_server_ctx)
-    {
-        QMessageBox::critical(this, "Ошибка", "Не удалось создать контекст SSL!");
-        return;
-    }
-
-    if (!ssl_server_ctx->loadCertificateAndKey("cert/bench-server-cert.pem", "cert/bench-server-key.pem"))
-    {
-        QMessageBox::critical(this, "Ошибка", "Не удалось загрузить сертификат сервера!");
-        return;
-    }
-
-    std::unique_ptr<TlsContext> ssl_client_ctx = TlsContext::createClientContext(false);
-    if (!ssl_client_ctx)
-    {
-        QMessageBox::critical(this, "Ошибка", "Не удалось создать контекст SSL!");
-        return;
-    }
-
-    QList<long long> handshake_measurements;
-    long long time_handshake = 0;
-
-    int handshake_succeeded = HANDSHAKE_ATTEMPTS;
-
-    for (int i = 0; i < HANDSHAKE_ATTEMPTS; i++)
-    {
-        std::unique_ptr<TlsSession> ssl_client;
-        std::unique_ptr<TlsSession> ssl_server;
-
-        if (!TlsSession::createConnectedPair(*ssl_client_ctx, *ssl_server_ctx, ssl_client, ssl_server)
-                || !TlsSession::performInMemoryHandshake(*ssl_client, *ssl_server, time_handshake))
-        {
-            --handshake_succeeded;
-        }
-        else
-        {
-            handshake_measurements << time_handshake;
-        }
-
-        performed += 1;
-        ui->progressBar->setValue(100 * performed / totalActions);
-    }
-
-    ui->spinBox_2->setValue(handshake_succeeded);
-
-    QList<long long> handshake_statistics = GetStatistics(handshake_measurements);
-
-    for (int i = 0; i < 6; i++)
-    {
-        ui->tableWidget->setItem(2, i, new QTableWidgetItem(QString::number(static_cast<double>(handshake_statistics[i]) / 1000.0)));
-    }
-
-    // 3 - время обмена
-    QList<long long> msg_exchange_measurements;
-    long long time_exchange = 0;
-
-    for (int iSession = 0; iSession < MESSAGE_EXCHANGE_SESSIONS; iSession++)
-    {
-        std::unique_ptr<TlsSession> ssl_client;
-        std::unique_ptr<TlsSession> ssl_server;
-
-        if (!TlsSession::createConnectedPair(*ssl_client_ctx, *ssl_server_ctx, ssl_client, ssl_server)
-                || !TlsSession::performInMemoryHandshake(*ssl_client, *ssl_server, time_handshake))
-        {
-            continue;
-        }
-
-        bool session_ok = true;
-
-        auto start = high_resolution_clock::now();
-
-        for (int i = 0; i < MESSAGES_TO_SEND; i++)
-        {
-            if (!TLS_send_message(*ssl_client, *ssl_server))
-            {
-                session_ok = false;
-                break;
-            }
-        }
-
-        auto stop = high_resolution_clock::now();
-        auto duration = duration_cast<microseconds>(stop - start);
-        time_exchange = time_handshake + duration.count();
-
-        performed += 1;
-        ui->progressBar->setValue(100 * performed / totalActions);
-
-        if (!session_ok)
-            continue;
-
-        msg_exchange_measurements << time_exchange;
-    }
-
-    ui->spinBox_3->setValue(MESSAGES_TO_SEND);
-    ui->lineEdit_4->setText(QString::number(MESSAGES_TO_SEND * MESSAGE_SIZE / 1024) + " КБ");
-
-    QList<long long> msg_exchange_statistics = GetStatistics(msg_exchange_measurements);
-
-    for (int i = 0; i < 6; i++)
-    {
-        ui->tableWidget->setItem(3, i, new QTableWidgetItem(QString::number(static_cast<double>(msg_exchange_statistics[i]) / 1000000.0)));
-    }
-
+    std::remove("cert/test-ca-cert.pem");
+    std::remove("cert/test-ca-key.pem");
     std::remove("cert/bench-ca-cert.pem");
     std::remove("cert/bench-ca-key.pem");
     std::remove("cert/bench-server-cert.pem");
@@ -271,20 +24,32 @@ void Benchmark::StartBench()
     std::remove("cert/bench-server-req.pem");
 }
 
-bool Benchmark::TLS_send_message(TlsSession &ssl_client, TlsSession &ssl_server)
-{
-    char some_data[MESSAGE_SIZE * 2] = {};
+} // namespace
 
-    if (ssl_client.sendApplicationData(some_data, MESSAGE_SIZE) != MESSAGE_SIZE)
+// ============================================================================
+// BenchmarkWorker
+// ============================================================================
+
+BenchmarkWorker::BenchmarkWorker(const BenchmarkConfig &config, QObject *parent)
+    : QObject(parent)
+    , m_config(config)
+{
+}
+
+bool BenchmarkWorker::sendAndReceiveMessage(TlsSession &sslClient, TlsSession &sslServer)
+{
+    char someData[kMessageSize * 2] = {};
+
+    if (sslClient.sendApplicationData(someData, kMessageSize) != kMessageSize)
         return false;
 
-    if (ssl_server.receiveApplicationData(some_data, MESSAGE_SIZE * 2) != MESSAGE_SIZE)
+    if (sslServer.receiveApplicationData(someData, kMessageSize * 2) != kMessageSize)
         return false;
 
     return true;
 }
 
-QList<long long> Benchmark::GetStatistics(QList<long long> measurements)
+QList<long long> BenchmarkWorker::computeStatistics(QList<long long> measurements)
 {
     QList<long long> result;
 
@@ -307,13 +72,374 @@ QList<long long> Benchmark::GetStatistics(QList<long long> measurements)
     return result;
 }
 
+void BenchmarkWorker::process()
+{
+    const long totalActions = m_config.certSignAttempts * 2 + m_config.handshakeAttempts + kMessageExchangeSessions;
+    long performed = 0;
+    int lastPercent = -1;
+
+    auto updateProgress = [&](long delta) {
+        performed += delta;
+        if (totalActions > 0)
+        {
+            int percent = static_cast<int>(100 * performed / totalActions);
+            if (percent != lastPercent)
+            {
+                lastPercent = percent;
+                emit progressUpdated(percent);
+            }
+        }
+    };
+
+    auto isInterrupted = []() {
+        QThread *thr = QThread::currentThread();
+        return thr && thr->isInterruptionRequested();
+    };
+
+    QDir().mkpath("cert");
+
+    // 1 - Скорость создания и проверки подписи
+    const std::string caCertPath = "cert/test-ca-cert.pem";
+    const std::string caKeyPath = "cert/test-ca-key.pem";
+
+    if (!CertificateGenerator::generateCaCertificate(m_config.certAlgorithm, caCertPath, caKeyPath))
+    {
+        removeBenchTempFiles();
+        emit errorOccurred("Не удалось создать сертификат ЦС");
+        return;
+    }
+
+    X509ReqPtr x509req = CertificateGenerator::createServerCsr(m_config.certAlgorithm);
+    if (!x509req)
+    {
+        removeBenchTempFiles();
+        emit errorOccurred("Не удалось создать сертификат запроса");
+        return;
+    }
+
+    X509Ptr caCert = CertificateGenerator::loadCertificate(caCertPath);
+    EvpPkeyPtr caPublicKey = CertificateGenerator::extractPublicKey(caCert.get());
+    EvpPkeyPtr caPrivateKey = CertificateGenerator::loadPrivateKey(caKeyPath);
+
+    if (!caCert || !caPublicKey || !caPrivateKey)
+    {
+        removeBenchTempFiles();
+        emit errorOccurred("Не удалось открыть сертификат или ключ ЦС");
+        return;
+    }
+
+    QList<long long> certSignMeasurements;
+    QList<long long> certVerifyMeasurements;
+    long long timeSignMicrosec = 0;
+    long long timeVerifyMicrosec = 0;
+
+    int certSignSucceeded = static_cast<int>(m_config.certSignAttempts);
+    int certVerifySucceeded = static_cast<int>(m_config.certSignAttempts);
+
+    for (long i = 0; i < m_config.certSignAttempts; i++)
+    {
+        if (isInterrupted())
+        {
+            removeBenchTempFiles();
+            return;
+        }
+
+        if (!CertificateGenerator::benchmarkSignAndVerify(
+                x509req.get(),
+                m_config.certAlgorithm,
+                caCert.get(),
+                caPublicKey.get(),
+                caPrivateKey.get(),
+                timeSignMicrosec,
+                timeVerifyMicrosec))
+        {
+            --certSignSucceeded;
+        }
+        else
+        {
+            certSignMeasurements << timeSignMicrosec;
+        }
+
+        if (timeVerifyMicrosec == 0)
+            --certVerifySucceeded;
+        else
+            certVerifyMeasurements << timeVerifyMicrosec;
+
+        updateProgress(2);
+    }
+
+    std::remove(caCertPath.c_str());
+    std::remove(caKeyPath.c_str());
+
+    // 2 - скорость установления хендшейка и обмена
+    if (!CertificateGenerator::generateServerCertificateChain(
+            m_config.certAlgorithm,
+            "cert/bench-ca-cert.pem",
+            "cert/bench-ca-key.pem",
+            "cert/bench-server-req.pem",
+            "cert/bench-server-key.pem",
+            "cert/bench-server-cert.pem"))
+    {
+        removeBenchTempFiles();
+        emit errorOccurred("Не удалось создать сертификат серверу!");
+        return;
+    }
+
+    std::unique_ptr<TlsContext> sslServerCtx = TlsContext::createServerContext(m_config.cipherSuite);
+    if (!sslServerCtx)
+    {
+        removeBenchTempFiles();
+        emit errorOccurred("Не удалось создать контекст SSL!");
+        return;
+    }
+
+    if (!sslServerCtx->loadCertificateAndKey("cert/bench-server-cert.pem", "cert/bench-server-key.pem"))
+    {
+        removeBenchTempFiles();
+        emit errorOccurred("Не удалось загрузить сертификат сервера!");
+        return;
+    }
+
+    std::unique_ptr<TlsContext> sslClientCtx = TlsContext::createClientContext(false);
+    if (!sslClientCtx)
+    {
+        removeBenchTempFiles();
+        emit errorOccurred("Не удалось создать контекст SSL!");
+        return;
+    }
+
+    QList<long long> handshakeMeasurements;
+    long long timeHandshake = 0;
+    int handshakeSucceeded = static_cast<int>(m_config.handshakeAttempts);
+
+    for (long i = 0; i < m_config.handshakeAttempts; i++)
+    {
+        if (isInterrupted())
+        {
+            removeBenchTempFiles();
+            return;
+        }
+
+        std::unique_ptr<TlsSession> sslClient;
+        std::unique_ptr<TlsSession> sslServer;
+
+        if (!TlsSession::createConnectedPair(*sslClientCtx, *sslServerCtx, sslClient, sslServer)
+                || !TlsSession::performInMemoryHandshake(*sslClient, *sslServer, timeHandshake))
+        {
+            --handshakeSucceeded;
+        }
+        else
+        {
+            handshakeMeasurements << timeHandshake;
+        }
+
+        updateProgress(1);
+    }
+
+    // 3 - время обмена
+    QList<long long> msgExchangeMeasurements;
+    long long timeExchange = 0;
+
+    for (int iSession = 0; iSession < kMessageExchangeSessions; iSession++)
+    {
+        if (isInterrupted())
+        {
+            removeBenchTempFiles();
+            return;
+        }
+
+        std::unique_ptr<TlsSession> sslClient;
+        std::unique_ptr<TlsSession> sslServer;
+
+        if (!TlsSession::createConnectedPair(*sslClientCtx, *sslServerCtx, sslClient, sslServer)
+                || !TlsSession::performInMemoryHandshake(*sslClient, *sslServer, timeHandshake))
+        {
+            updateProgress(1);
+            continue;
+        }
+
+        bool sessionOk = true;
+        auto start = high_resolution_clock::now();
+
+        for (long i = 0; i < m_config.messagesToSend; i++)
+        {
+            if ((i & 0x3FF) == 0 && isInterrupted())
+            {
+                removeBenchTempFiles();
+                return;
+            }
+
+            if (!sendAndReceiveMessage(*sslClient, *sslServer))
+            {
+                sessionOk = false;
+                break;
+            }
+        }
+
+        auto stop = high_resolution_clock::now();
+        auto duration = duration_cast<microseconds>(stop - start);
+        timeExchange = timeHandshake + duration.count();
+
+        updateProgress(1);
+
+        if (sessionOk)
+            msgExchangeMeasurements << timeExchange;
+    }
+
+    removeBenchTempFiles();
+
+    BenchmarkResult result;
+    result.certSignSucceeded = certSignSucceeded;
+    result.certVerifySucceeded = certVerifySucceeded;
+    result.handshakeSucceeded = handshakeSucceeded;
+    result.messagesToSend = m_config.messagesToSend;
+    result.certSignStats = computeStatistics(certSignMeasurements);
+    result.certVerifyStats = computeStatistics(certVerifyMeasurements);
+    result.handshakeStats = computeStatistics(handshakeMeasurements);
+    result.msgExchangeStats = computeStatistics(msgExchangeMeasurements);
+
+    emit finished(result);
+}
+
+// ============================================================================
+// Benchmark
+// ============================================================================
+
+Benchmark::Benchmark(QWidget *parent) :
+    QWidget(parent),
+    ui(new Ui::Benchmark)
+{
+    qRegisterMetaType<BenchmarkResult>("BenchmarkResult");
+    ui->setupUi(this);
+
+    ResetTable();
+}
+
+Benchmark::~Benchmark()
+{
+    stopWorkerThread();
+    delete ui;
+}
+
+void Benchmark::closeEvent(QCloseEvent *event)
+{
+    stopWorkerThread();
+    emit Closed();
+    event->accept();
+}
+
+void Benchmark::stopWorkerThread()
+{
+    if (m_workerThread)
+    {
+        m_workerThread->requestInterruption();
+        m_workerThread->quit();
+        m_workerThread->wait();
+        delete m_workerThread;
+        m_workerThread = nullptr;
+    }
+}
+
+void Benchmark::setControlsEnabled(bool enabled)
+{
+    ui->pushButton->setEnabled(enabled);
+    ui->spinBox->setEnabled(enabled);
+    ui->spinBox_2->setEnabled(enabled);
+    ui->spinBox_3->setEnabled(enabled);
+    ui->groupBox->setEnabled(enabled);
+}
+
+void Benchmark::ResetTable()
+{
+    for (int i = 0; i < ui->tableWidget->rowCount(); i++)
+    {
+        for (int j = 0; j < ui->tableWidget->columnCount(); j++)
+        {
+            ui->tableWidget->setItem(i, j, new QTableWidgetItem("0"));
+        }
+    }
+
+    ui->spinBox->setValue(CERT_SIGN_ATTEMPTS);
+    ui->spinBox_2->setValue(HANDSHAKE_ATTEMPTS);
+    ui->spinBox_3->setValue(MESSAGES_TO_SEND);
+    ui->lineEdit_4->setText("0");
+    ui->progressBar->setValue(0);
+}
+
+void Benchmark::StartBench()
+{
+    stopWorkerThread();
+
+    BenchmarkConfig config;
+    if (ui->radioButton->isChecked())
+        config.cipherSuite = "TLS_AES_256_GCM_SHA384";
+    else if (ui->radioButton_2->isChecked())
+        config.cipherSuite = "TLS_CHACHA20_POLY1305_SHA256";
+    else if (ui->radioButton_3->isChecked())
+        config.cipherSuite = "TLS_AES_128_GCM_SHA256";
+
+    if (ui->radioButton_5->isChecked())
+        config.certAlgorithm = CertAlgorithm::Rsa;
+    else if (ui->radioButton_4->isChecked())
+        config.certAlgorithm = CertAlgorithm::Ecdsa;
+    else if (ui->radioButton_6->isChecked())
+        config.certAlgorithm = CertAlgorithm::Ed25519;
+
+    config.certSignAttempts = CERT_SIGN_ATTEMPTS;
+    config.handshakeAttempts = HANDSHAKE_ATTEMPTS;
+    config.messagesToSend = MESSAGES_TO_SEND;
+
+    m_workerThread = new QThread(this);
+    BenchmarkWorker *worker = new BenchmarkWorker(config);
+    worker->moveToThread(m_workerThread);
+
+    connect(m_workerThread, &QThread::started, worker, &BenchmarkWorker::process);
+    connect(worker, &BenchmarkWorker::progressUpdated, this, &Benchmark::onBenchmarkProgress);
+    connect(worker, &BenchmarkWorker::finished, this, &Benchmark::onBenchmarkFinished);
+    connect(worker, &BenchmarkWorker::errorOccurred, this, &Benchmark::onBenchmarkError);
+    connect(m_workerThread, &QThread::finished, worker, &QObject::deleteLater);
+
+    setControlsEnabled(false);
+    m_workerThread->start();
+}
+
+void Benchmark::onBenchmarkProgress(int percent)
+{
+    ui->progressBar->setValue(percent);
+}
+
+void Benchmark::onBenchmarkFinished(const BenchmarkResult &result)
+{
+    stopWorkerThread();
+
+    ui->spinBox->setValue(result.certSignSucceeded);
+    ui->spinBox_2->setValue(result.handshakeSucceeded);
+    ui->spinBox_3->setValue(result.messagesToSend);
+    ui->lineEdit_4->setText(QString::number(result.messagesToSend * BenchmarkWorker::kMessageSize / 1024) + " КБ");
+    ui->progressBar->setValue(100);
+
+    for (int i = 0; i < 6; i++)
+    {
+        ui->tableWidget->setItem(0, i, new QTableWidgetItem(QString::number(static_cast<double>(result.certSignStats[i]) / 1000.0)));
+        ui->tableWidget->setItem(1, i, new QTableWidgetItem(QString::number(static_cast<double>(result.certVerifyStats[i]) / 1000.0)));
+        ui->tableWidget->setItem(2, i, new QTableWidgetItem(QString::number(static_cast<double>(result.handshakeStats[i]) / 1000.0)));
+        ui->tableWidget->setItem(3, i, new QTableWidgetItem(QString::number(static_cast<double>(result.msgExchangeStats[i]) / 1000000.0)));
+    }
+
+    setControlsEnabled(true);
+}
+
+void Benchmark::onBenchmarkError(const QString &message)
+{
+    stopWorkerThread();
+    QMessageBox::critical(this, "Ошибка", message);
+    setControlsEnabled(true);
+}
+
 void Benchmark::on_pushButton_clicked()
 {
-    ui->pushButton->setEnabled(false);
     ResetTable();
     StartBench();
-    ui->pushButton->setEnabled(true);
-    return;
 }
 
 void Benchmark::on_spinBox_valueChanged(int arg1)
