@@ -1,6 +1,9 @@
 #include "benchmark.h"
 #include "ui_benchmark.h"
 
+#include <algorithm>
+#include <numeric>
+
 using namespace std::chrono;
 
 Benchmark::Benchmark(QWidget *parent) :
@@ -42,14 +45,14 @@ void Benchmark::ResetTable()
 
 void Benchmark::StartBench()
 {
-    char alg_string[256] = "";
+    const char *alg_string = "";
 
     if (ui->radioButton->isChecked())
-        snprintf(alg_string, 256 - strlen(alg_string), "%sTLS_AES_256_GCM_SHA384", alg_string);
+        alg_string = "TLS_AES_256_GCM_SHA384";
     else if (ui->radioButton_2->isChecked())
-        snprintf(alg_string, 256 - strlen(alg_string), "%sTLS_CHACHA20_POLY1305_SHA256", alg_string);
+        alg_string = "TLS_CHACHA20_POLY1305_SHA256";
     else if (ui->radioButton_3->isChecked())
-        snprintf(alg_string, 256 - strlen(alg_string), "%sTLS_AES_128_GCM_SHA256", alg_string);
+        alg_string = "TLS_AES_128_GCM_SHA256";
 
     int cert_alg = 0;
 
@@ -148,6 +151,8 @@ void Benchmark::StartBench()
             || (x509req = create_server_req(cert_alg, "cert\\bench-server-req.pem", "cert\\bench-server-key.pem")) == NULL
             || !create_server_cert(x509req, cert_alg, "cert\\bench-ca-cert.pem", "cert\\bench-ca-key.pem", "cert\\bench-server-cert.pem"))
     {
+        if (x509req)
+            X509_REQ_free(x509req);
         QMessageBox::critical(this, "Ошибка", "Не удалось создать сертификат серверу!");
         return;
     }
@@ -279,7 +284,7 @@ void Benchmark::StartBench()
 
     for (int i = 0; i < 6; i++)
     {
-        ui->tableWidget->setItem(3, i, new QTableWidgetItem(QString::number((double)(msg_exchange_statistics[i] / 1000) / 1000)));
+        ui->tableWidget->setItem(3, i, new QTableWidgetItem(QString::number(static_cast<double>(msg_exchange_statistics[i]) / 1000000.0)));
     }
 
     remove("cert\\bench-ca-cert.pem");
@@ -350,12 +355,13 @@ bool Benchmark::TLS_Handshake(SSL* ssl_client, SSL* ssl_server, long long &time_
 
 bool Benchmark::TLS_send_message(SSL *ssl_client, SSL *ssl_server)
 {
-    char some_data[MESSAGE_SIZE * 2];
+    char some_data[MESSAGE_SIZE * 2] = {};
 
     if (tls_send_packet(ssl_client, some_data, MESSAGE_SIZE) != MESSAGE_SIZE)
         return false;
 
-    tls_recv_packet(ssl_server, some_data, MESSAGE_SIZE * 2);
+    if (tls_recv_packet(ssl_server, some_data, MESSAGE_SIZE * 2) != MESSAGE_SIZE)
+        return false;
 
     return true;
 }
@@ -371,7 +377,7 @@ QList<long long> Benchmark::GetStatistics(QList<long long> measurements)
     }
 
     std::sort(measurements.begin(), measurements.end());
-    long long sum = std::accumulate(measurements.begin(), measurements.end(), 0);
+    long long sum = std::accumulate(measurements.begin(), measurements.end(), 0LL);
 
     result << measurements.first();
     result << sum / measurements.count();

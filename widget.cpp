@@ -1,13 +1,15 @@
 #include "widget.h"
 #include "ui_widget.h"
 
+#include <QDir>
+
 Widget::Widget(QWidget *parent) :
     QWidget(parent),
     ui(new Ui::Widget)
 {
     ui->setupUi(this);
 
-    system("mkdir cert");
+    QDir().mkpath("cert");
 
     init_openssl();
 }
@@ -26,14 +28,6 @@ Widget::~Widget()
     if (ssl_client_ctx)
         SSL_CTX_free(ssl_client_ctx);
 
-    X509* server_crt;
-    FILE* f;
-
-    fopen_s(&f, "cert\\server-cert.pem", "r");
-
-    if ((server_crt = PEM_read_X509(f, NULL, 0, NULL)) != NULL)
-        fclose(f);
-
     cleanup_openssl();
 
     delete ui;
@@ -51,21 +45,21 @@ void Widget::slotClientConnected()
     unsigned char *c_ip = (unsigned char*)&ip;
     ui->label->setText(QString("Входящее соединение от клиента ") + QString::number(c_ip[3]) + "." + QString::number(c_ip[2]) + "." + QString::number(c_ip[1]) + "." + QString::number(c_ip[0]));
     ChatDialog *chat_dialog = new ChatDialog(tcp_socket, true, ssl_server_ctx);
+    chat_dialog->setAttribute(Qt::WA_DeleteOnClose);
     chat_dialog->show();
-    //connect(tcp_socket, SIGNAL(readyRead()), this, SLOT(slotReadClient()));
 }
 
 bool Widget::StartServer()
 {
-    char alg_string[256] = "";
+    const char *alg_string = "";
 
     // выбор алгоритма шифрования на сессию
     if (ui->radioButton->isChecked())
-        snprintf(alg_string, 256 - strlen(alg_string), "%sTLS_AES_256_GCM_SHA384", alg_string);
+        alg_string = "TLS_AES_256_GCM_SHA384";
     else if (ui->radioButton_2->isChecked())
-        snprintf(alg_string, 256 - strlen(alg_string), "%sTLS_CHACHA20_POLY1305_SHA256", alg_string);
+        alg_string = "TLS_CHACHA20_POLY1305_SHA256";
     else if (ui->radioButton_3->isChecked())
-        snprintf(alg_string, 256 - strlen(alg_string), "%sTLS_AES_128_GCM_SHA256", alg_string);
+        alg_string = "TLS_AES_128_GCM_SHA256";
 
     // создания контекста SSL для сервера
     ssl_server_ctx = create_server_context(alg_string);
@@ -79,8 +73,8 @@ bool Widget::StartServer()
     // загрузка сертификатов сервера
     if (!load_server_cert(ssl_server_ctx, "cert\\server-cert.pem", "cert\\server-key.pem"))
     {
-        if (ssl_server_ctx)
-            SSL_CTX_free(ssl_server_ctx);
+        SSL_CTX_free(ssl_server_ctx);
+        ssl_server_ctx = nullptr;
 
         ui->label->setText("Не удалось загрузить сертификат и ключ сервера!");
         return false;
@@ -92,10 +86,12 @@ bool Widget::StartServer()
 
     if (!tcp_server->listen(QHostAddress::Any, 13337))
     {
-        if (ssl_server_ctx)
-            SSL_CTX_free(ssl_server_ctx);
+        SSL_CTX_free(ssl_server_ctx);
+        ssl_server_ctx = nullptr;
 
         ui->label->setText(QObject::tr("Не удалось запустить сервер: %1.").arg(tcp_server->errorString()));
+        delete tcp_server;
+        tcp_server = nullptr;
         return false;
     }
     else
@@ -116,20 +112,29 @@ void Widget::ConnectToIP()
 
     if (!tcp_socket->waitForConnected())
     {
+        delete tcp_socket;
         QMessageBox::critical(this, "Ошибка", "Не удалось установить соединение с сервером!");
     }
     else
     {
         ui->lineEdit->clear();
+        if (ssl_client_ctx)
+        {
+            SSL_CTX_free(ssl_client_ctx);
+            ssl_client_ctx = nullptr;
+        }
         ssl_client_ctx = create_client_context(true);
 
         if (!ssl_client_ctx)
         {
+            tcp_socket->close();
+            delete tcp_socket;
             QMessageBox::critical(this, "Ошибка", "Не удалось создать контекст SSL!");
             return;
         }
 
         ChatDialog *chat_dialog = new ChatDialog(tcp_socket, false, ssl_client_ctx);
+        chat_dialog->setAttribute(Qt::WA_DeleteOnClose);
         chat_dialog->show();
     }
 }
