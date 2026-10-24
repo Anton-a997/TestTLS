@@ -5,9 +5,7 @@
 
 void init_openssl()
 {
-    SSL_library_init();
-    SSL_load_error_strings();
-    OpenSSL_add_ssl_algorithms();
+    OPENSSL_init_ssl(0, NULL);
 }
 
 void cleanup_openssl()
@@ -84,7 +82,7 @@ bool load_server_cert(SSL_CTX *ctx, const char* cert_path, const char* key_path)
 }
 
 // добавление расширений сертификата (назначение, использование...)
-int add_cert_ext(X509 *cert, int nid, char *value)
+int add_cert_ext(X509 *cert, int nid, const char *value, X509 *issuer = NULL)
 {
     X509_EXTENSION *ex;
     X509V3_CTX ctx;
@@ -93,24 +91,24 @@ int add_cert_ext(X509 *cert, int nid, char *value)
     /* No configuration database */
     X509V3_set_ctx_nodb(&ctx);
 
-    /* Issuer and subject certs: both the target since it is self signed,
+    /* Issuer and subject certs: both the target if self signed,
      * no request and no CRL
      */
-    X509V3_set_ctx(&ctx, cert, cert, NULL, NULL, 0);
+    X509V3_set_ctx(&ctx, issuer ? issuer : cert, cert, NULL, NULL, 0);
     ex = X509V3_EXT_conf_nid(NULL, &ctx, nid, value);
 
     if (!ex)
         return 0;
 
-    X509_add_ext(cert, ex, -1);
+    int ok = X509_add_ext(cert, ex, -1);
     X509_EXTENSION_free(ex);
 
-    return 1;
+    return ok;
 }
 
 bool create_ca_cert(int alg, const char *fname_cert, const char *fname_key)
 {
-    EVP_PKEY* pkey;
+    EVP_PKEY* pkey = NULL;
 
     // выбор алгоритма серт и генерация ключа
     switch (alg)
@@ -138,9 +136,15 @@ bool create_ca_cert(int alg, const char *fname_cert, const char *fname_key)
     }
 
     X509* x509 = X509_new(); // создание серт
+    if (!x509)
+    {
+        EVP_PKEY_free(pkey);
+        return false;
+    }
+
     ASN1_INTEGER_set(X509_get_serialNumber(x509), 1); // серийный номер
-    X509_gmtime_adj(X509_get_notBefore(x509), 0); // действует с
-    X509_gmtime_adj(X509_get_notAfter(x509), 31536000L); // действует по
+    X509_gmtime_adj(X509_getm_notBefore(x509), 0); // действует с
+    X509_gmtime_adj(X509_getm_notAfter(x509), 31536000L); // действует по
     X509_set_version(x509, 2); // версия V3
 
     // задаем открытый ключ
@@ -161,10 +165,10 @@ bool create_ca_cert(int alg, const char *fname_cert, const char *fname_key)
     X509_set_issuer_name(x509, name);
 
     // расширения сертификата
-    if (!add_cert_ext(x509, NID_basic_constraints, (char*)"CA:TRUE")
-            || !add_cert_ext(x509, NID_key_usage, (char*)"keyCertSign,cRLSign")
-            || !add_cert_ext(x509, NID_subject_key_identifier, (char*)"hash")
-            || !add_cert_ext(x509, NID_authority_key_identifier, (char*)"keyid:always"))
+    if (!add_cert_ext(x509, NID_basic_constraints, "CA:TRUE")
+            || !add_cert_ext(x509, NID_key_usage, "keyCertSign,cRLSign")
+            || !add_cert_ext(x509, NID_subject_key_identifier, "hash")
+            || !add_cert_ext(x509, NID_authority_key_identifier, "keyid:always"))
     {
         fprintf(stderr, "add_cert_ext failed\n");
         EVP_PKEY_free(pkey);
@@ -188,10 +192,12 @@ bool create_ca_cert(int alg, const char *fname_cert, const char *fname_key)
         break;
 
     default:
+        EVP_PKEY_free(pkey);
+        X509_free(x509);
         return false;
     }
 
-    if (!err)
+    if (err <= 0)
     {
         fprintf(stderr, "X509_sign failed\n");
         EVP_PKEY_free(pkey);
@@ -201,38 +207,54 @@ bool create_ca_cert(int alg, const char *fname_cert, const char *fname_key)
     }
 
     // сохранение в файл
-    FILE * f;
-    fopen_s(&f, fname_key, "wb");
+    FILE * f = NULL;
+    if (fopen_s(&f, fname_key, "wb") != 0 || !f)
+    {
+        EVP_PKEY_free(pkey);
+        X509_free(x509);
+        return false;
+    }
 
-    PEM_write_PrivateKey(
+    int write_key_ok = PEM_write_PrivateKey(
         f,                  /* write the key to the file we've opened */
         pkey,               /* our key from earlier */
         NULL,               /* default cipher for encrypting the key on disk */
         NULL,               /* passphrase required for decrypting the key on disk */
-        10,                 /* length of the passphrase string */
+        0,                  /* length of the passphrase string */
         NULL,               /* callback for requesting a password */
         NULL                /* data to pass to the callback */
     );
-
     fclose(f);
-    fopen_s(&f, fname_cert, "wb");
 
-    PEM_write_X509(
+    if (!write_key_ok)
+    {
+        EVP_PKEY_free(pkey);
+        X509_free(x509);
+        return false;
+    }
+
+    if (fopen_s(&f, fname_cert, "wb") != 0 || !f)
+    {
+        EVP_PKEY_free(pkey);
+        X509_free(x509);
+        return false;
+    }
+
+    int write_cert_ok = PEM_write_X509(
         f,   /* write the certificate to the file we've opened */
         x509 /* our certificate */
     );
-
     fclose(f);
 
     EVP_PKEY_free(pkey);
     X509_free(x509);
 
-    return true;
+    return write_cert_ok != 0;
 }
 
 X509_REQ* create_server_req(int alg, const char *fname_req, const char *fname_key)
 {
-    EVP_PKEY* pkey;
+    EVP_PKEY* pkey = NULL;
 
     // генерация ключа
     switch (alg)
@@ -261,10 +283,21 @@ X509_REQ* create_server_req(int alg, const char *fname_req, const char *fname_ke
 
     // создания серт запроса
     X509_REQ* x509req = X509_REQ_new();
+    if (!x509req)
+    {
+        EVP_PKEY_free(pkey);
+        return NULL;
+    }
     X509_REQ_set_version(x509req, 2);
 
     // имя, страна...
     X509_NAME* name = X509_NAME_new();
+    if (!name)
+    {
+        EVP_PKEY_free(pkey);
+        X509_REQ_free(x509req);
+        return NULL;
+    }
     X509_NAME_add_entry_by_txt(name, "C",  MBSTRING_ASC, (unsigned char *)"UA", -1, -1, 0);
     X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC, (unsigned char *)"TLS 1.3 Server", -1, -1, 0);
 
@@ -272,6 +305,7 @@ X509_REQ* create_server_req(int alg, const char *fname_req, const char *fname_ke
     if (!X509_REQ_set_subject_name(x509req, name))
     {
         fprintf(stderr, "X509_REQ_set_subject_name failed\n");
+        X509_NAME_free(name);
         EVP_PKEY_free(pkey);
         X509_REQ_free(x509req);
 
@@ -305,10 +339,12 @@ X509_REQ* create_server_req(int alg, const char *fname_req, const char *fname_ke
         break;
 
     default:
+        EVP_PKEY_free(pkey);
+        X509_REQ_free(x509req);
         return NULL;
     }
 
-    if (!err)
+    if (err <= 0)
     {
         fprintf(stderr, "X509_REQ_sign failed\n");
         EVP_PKEY_free(pkey);
@@ -318,31 +354,52 @@ X509_REQ* create_server_req(int alg, const char *fname_req, const char *fname_ke
     }
 
     // запись в файл
-    FILE * f;
-    fopen_s(&f, fname_key, "wb");
+    FILE * f = NULL;
+    if (fopen_s(&f, fname_key, "wb") != 0 || !f)
+    {
+        EVP_PKEY_free(pkey);
+        X509_REQ_free(x509req);
+        return NULL;
+    }
 
-    PEM_write_PrivateKey(
+    int write_key_ok = PEM_write_PrivateKey(
         f,                  /* write the key to the file we've opened */
         pkey,               /* our key from earlier */
         NULL,               /* default cipher for encrypting the key on disk */
         NULL,               /* passphrase required for decrypting the key on disk */
-        10,                 /* length of the passphrase string */
+        0,                  /* length of the passphrase string */
         NULL,               /* callback for requesting a password */
         NULL                /* data to pass to the callback */
     );
-
     fclose(f);
-    fopen_s(&f, fname_req, "wb");
 
-    PEM_write_X509_REQ(
-        f,   /* write the certificate to the file we've opened */
+    if (!write_key_ok)
+    {
+        EVP_PKEY_free(pkey);
+        X509_REQ_free(x509req);
+        return NULL;
+    }
+
+    if (fopen_s(&f, fname_req, "wb") != 0 || !f)
+    {
+        EVP_PKEY_free(pkey);
+        X509_REQ_free(x509req);
+        return NULL;
+    }
+
+    int write_req_ok = PEM_write_X509_REQ(
+        f,      /* write the certificate to the file we've opened */
         x509req /* our certificate */
     );
-
     fclose(f);
 
     EVP_PKEY_free(pkey);
-    //X509_REQ_free(x509req);
+
+    if (!write_req_ok)
+    {
+        X509_REQ_free(x509req);
+        return NULL;
+    }
 
     return x509req;
 }
@@ -369,6 +426,7 @@ int randSerial(ASN1_INTEGER *ai)
         return -1;
     }
 
+    BN_free(p_bignum);
     return 1;
 }
 
@@ -376,7 +434,6 @@ bool create_server_cert(X509_REQ* x509req, int alg, const char* p_ca_cert_path, 
 {
     FILE *p_ca_cert_file = NULL;
     X509 *p_ca_cert = NULL;
-    EVP_PKEY *p_ca_pkey = NULL;
     FILE *p_ca_key_file = NULL;
     EVP_PKEY *p_ca_key_pkey = NULL;
     X509 *p_generated_cert = NULL;
@@ -384,90 +441,84 @@ bool create_server_cert(X509_REQ* x509req, int alg, const char* p_ca_cert_path, 
     EVP_PKEY *p_cert_req_pkey = NULL;
 
     // чтение серт ЦС
-    if (fopen_s(&p_ca_cert_file, p_ca_cert_path, "r") != 0)
+    if (fopen_s(&p_ca_cert_file, p_ca_cert_path, "r") != 0 || !p_ca_cert_file)
     {
         return false;
     }
 
-    if (NULL == (p_ca_cert = PEM_read_X509(p_ca_cert_file, NULL, 0, NULL)))
-    {
-        fclose(p_ca_cert_file);
-        return false;
-    }
-
+    p_ca_cert = PEM_read_X509(p_ca_cert_file, NULL, 0, NULL);
     fclose(p_ca_cert_file);
-
-    // чтение открытого ключа ЦС
-    if (NULL == (p_ca_pkey = X509_get_pubkey(p_ca_cert)))
+    if (!p_ca_cert)
     {
         return false;
     }
 
-    if (fopen_s(&p_ca_key_file, p_ca_key_path, "r") != 0)
+    if (fopen_s(&p_ca_key_file, p_ca_key_path, "r") != 0 || !p_ca_key_file)
     {
+        X509_free(p_ca_cert);
         return false;
     }
 
     // чтение закрытого ключа ЦС
-    if (NULL == (p_ca_key_pkey = PEM_read_PrivateKey(p_ca_key_file, NULL, NULL, NULL)))
+    p_ca_key_pkey = PEM_read_PrivateKey(p_ca_key_file, NULL, NULL, NULL);
+    fclose(p_ca_key_file);
+    if (!p_ca_key_pkey)
     {
-        fclose(p_ca_key_file);
+        X509_free(p_ca_cert);
         return false;
     }
 
-    fclose(p_ca_key_file);
-
     // новый серт
-    if (NULL == (p_generated_cert = X509_new()))
+    p_generated_cert = X509_new();
+    if (!p_generated_cert)
     {
+        X509_free(p_ca_cert);
+        EVP_PKEY_free(p_ca_key_pkey);
         return false;
     }
 
     X509_set_version(p_generated_cert, 2); // версия V3
 
     p_serial_number = ASN1_INTEGER_new(); // серийный номер
-    randSerial(p_serial_number);
-    X509_set_serialNumber(p_generated_cert, p_serial_number);
+    if (!p_serial_number || randSerial(p_serial_number) < 0 || !X509_set_serialNumber(p_generated_cert, p_serial_number))
+    {
+        ASN1_INTEGER_free(p_serial_number);
+        X509_free(p_generated_cert);
+        X509_free(p_ca_cert);
+        EVP_PKEY_free(p_ca_key_pkey);
+        return false;
+    }
+    ASN1_INTEGER_free(p_serial_number);
+    p_serial_number = NULL;
 
-    X509_set_issuer_name(p_generated_cert, X509_REQ_get_subject_name(x509req)); // выдан кем
+    X509_set_issuer_name(p_generated_cert, X509_get_subject_name(p_ca_cert)); // выдан кем
     X509_set_subject_name(p_generated_cert, X509_REQ_get_subject_name(x509req)); // выдан кому
 
-    X509_gmtime_adj(X509_get_notBefore(p_generated_cert), 0L); // действует от
-    X509_gmtime_adj(X509_get_notAfter(p_generated_cert), 31536000L); // действует до
-
-    // расширения
-    if (!add_cert_ext(p_generated_cert, NID_key_usage, (char*)"digitalSignature")
-            || !add_cert_ext(p_generated_cert, NID_subject_key_identifier, (char*)"hash"))
-    {
-        X509_free(p_generated_cert);
-        p_generated_cert = NULL;
-        return false;
-    }
+    X509_gmtime_adj(X509_getm_notBefore(p_generated_cert), 0L); // действует от
+    X509_gmtime_adj(X509_getm_notAfter(p_generated_cert), 31536000L); // действует до
 
     // установка открытого ключа серт сервера из сертификата REQ
-    if (NULL == (p_cert_req_pkey = X509_REQ_get_pubkey(x509req)))
+    p_cert_req_pkey = X509_REQ_get_pubkey(x509req);
+    if (!p_cert_req_pkey || !X509_set_pubkey(p_generated_cert, p_cert_req_pkey))
     {
+        EVP_PKEY_free(p_cert_req_pkey);
         X509_free(p_generated_cert);
-        p_generated_cert = NULL;
+        X509_free(p_ca_cert);
+        EVP_PKEY_free(p_ca_key_pkey);
         return false;
     }
+    EVP_PKEY_free(p_cert_req_pkey);
+    p_cert_req_pkey = NULL;
 
-    if (0 > X509_set_pubkey(p_generated_cert, p_cert_req_pkey))
+    // расширения
+    if (!add_cert_ext(p_generated_cert, NID_key_usage, "digitalSignature", p_ca_cert)
+            || !add_cert_ext(p_generated_cert, NID_subject_key_identifier, "hash", p_ca_cert))
     {
         X509_free(p_generated_cert);
-        p_generated_cert = NULL;
+        X509_free(p_ca_cert);
+        EVP_PKEY_free(p_ca_key_pkey);
         return false;
     }
-
-    if (0 > EVP_PKEY_copy_parameters(p_ca_pkey, p_ca_key_pkey))
-    {
-        X509_free(p_generated_cert);
-        p_generated_cert = NULL;
-        return false;
-    }
-
-    // кем выдан
-    X509_set_issuer_name(p_generated_cert, X509_get_subject_name(p_ca_cert));
 
     int err = 0;
 
@@ -484,34 +535,41 @@ bool create_server_cert(X509_REQ* x509req, int alg, const char* p_ca_cert_path, 
         break;
 
     default:
+        X509_free(p_generated_cert);
+        X509_free(p_ca_cert);
+        EVP_PKEY_free(p_ca_key_pkey);
         return false;
     }
 
-    if (0 > err)
+    if (err <= 0)
     {
         X509_free(p_generated_cert);
-        p_generated_cert = NULL;
+        X509_free(p_ca_cert);
+        EVP_PKEY_free(p_ca_key_pkey);
         return false;
     }
 
     // запись в файл
-    FILE * f;
-    fopen_s(&f, fname_serv_cert, "wb");
+    FILE * f = NULL;
+    if (fopen_s(&f, fname_serv_cert, "wb") != 0 || !f)
+    {
+        X509_free(p_generated_cert);
+        X509_free(p_ca_cert);
+        EVP_PKEY_free(p_ca_key_pkey);
+        return false;
+    }
 
-    PEM_write_X509(
+    int write_ok = PEM_write_X509(
         f,
         p_generated_cert
     );
-
     fclose(f);
 
+    X509_free(p_generated_cert);
     X509_free(p_ca_cert);
-    EVP_PKEY_free(p_ca_pkey);
     EVP_PKEY_free(p_ca_key_pkey);
-    ASN1_INTEGER_free(p_serial_number);
-    EVP_PKEY_free(p_cert_req_pkey);
 
-    return true;
+    return write_ok != 0;
 }
 
 int tls_recv_packet(SSL* ssl, char* buf, int max_size)

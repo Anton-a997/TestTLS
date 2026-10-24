@@ -7,7 +7,7 @@
 
 using namespace std::chrono;
 
-int b_add_cert_ext(X509 *cert, int nid, char *value)
+int b_add_cert_ext(X509 *cert, int nid, const char *value, X509 *issuer = NULL)
 {
     X509_EXTENSION *ex;
     X509V3_CTX ctx;
@@ -16,24 +16,24 @@ int b_add_cert_ext(X509 *cert, int nid, char *value)
     /* No configuration database */
     X509V3_set_ctx_nodb(&ctx);
 
-    /* Issuer and subject certs: both the target since it is self signed,
+    /* Issuer and subject certs: both the target if self signed,
      * no request and no CRL
      */
-    X509V3_set_ctx(&ctx, cert, cert, NULL, NULL, 0);
+    X509V3_set_ctx(&ctx, issuer ? issuer : cert, cert, NULL, NULL, 0);
     ex = X509V3_EXT_conf_nid(NULL, &ctx, nid, value);
 
     if (!ex)
         return 0;
 
-    X509_add_ext(cert, ex, -1);
+    int ok = X509_add_ext(cert, ex, -1);
     X509_EXTENSION_free(ex);
 
-    return 1;
+    return ok;
 }
 
 bool b_create_ca_cert(int alg)
 {
-    EVP_PKEY* pkey;
+    EVP_PKEY* pkey = NULL;
 
     switch (alg)
     {
@@ -60,9 +60,15 @@ bool b_create_ca_cert(int alg)
     }
 
     X509* x509 = X509_new();
+    if (!x509)
+    {
+        EVP_PKEY_free(pkey);
+        return false;
+    }
+
     ASN1_INTEGER_set(X509_get_serialNumber(x509), 1);
-    X509_gmtime_adj(X509_get_notBefore(x509), 0);
-    X509_gmtime_adj(X509_get_notAfter(x509), 31536000L);
+    X509_gmtime_adj(X509_getm_notBefore(x509), 0);
+    X509_gmtime_adj(X509_getm_notAfter(x509), 31536000L);
     X509_set_version(x509, 2);
 
     if (!X509_set_pubkey(x509, pkey))
@@ -80,10 +86,10 @@ bool b_create_ca_cert(int alg)
     X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC, (unsigned char *)"CA", -1, -1, 0);
     X509_set_issuer_name(x509, name);
 
-    if (!b_add_cert_ext(x509, NID_basic_constraints, (char*)"CA:TRUE")
-            || !b_add_cert_ext(x509, NID_key_usage, (char*)"keyCertSign,cRLSign")
-            || !b_add_cert_ext(x509, NID_subject_key_identifier, (char*)"hash")
-            || !b_add_cert_ext(x509, NID_authority_key_identifier, (char*)"keyid:always"))
+    if (!b_add_cert_ext(x509, NID_basic_constraints, "CA:TRUE")
+            || !b_add_cert_ext(x509, NID_key_usage, "keyCertSign,cRLSign")
+            || !b_add_cert_ext(x509, NID_subject_key_identifier, "hash")
+            || !b_add_cert_ext(x509, NID_authority_key_identifier, "keyid:always"))
     {
         fprintf(stderr, "add_cert_ext failed\n");
         EVP_PKEY_free(pkey);
@@ -106,10 +112,12 @@ bool b_create_ca_cert(int alg)
         break;
 
     default:
+        EVP_PKEY_free(pkey);
+        X509_free(x509);
         return false;
     }
 
-    if (!err)
+    if (err <= 0)
     {
         fprintf(stderr, "X509_sign failed\n");
         EVP_PKEY_free(pkey);
@@ -120,38 +128,54 @@ bool b_create_ca_cert(int alg)
 
     system("mkdir cert");
 
-    FILE * f;
-    fopen_s(&f, "cert\\test-ca-key.pem", "wb");
+    FILE * f = NULL;
+    if (fopen_s(&f, "cert\\test-ca-key.pem", "wb") != 0 || !f)
+    {
+        EVP_PKEY_free(pkey);
+        X509_free(x509);
+        return false;
+    }
 
-    PEM_write_PrivateKey(
+    int write_key_ok = PEM_write_PrivateKey(
         f,                  /* write the key to the file we've opened */
         pkey,               /* our key from earlier */
         NULL,               /* default cipher for encrypting the key on disk */
         NULL,               /* passphrase required for decrypting the key on disk */
-        10,                 /* length of the passphrase string */
+        0,                  /* length of the passphrase string */
         NULL,               /* callback for requesting a password */
         NULL                /* data to pass to the callback */
     );
-
     fclose(f);
-    fopen_s(&f, "cert\\test-ca-cert.pem", "wb");
 
-    PEM_write_X509(
+    if (!write_key_ok)
+    {
+        EVP_PKEY_free(pkey);
+        X509_free(x509);
+        return false;
+    }
+
+    if (fopen_s(&f, "cert\\test-ca-cert.pem", "wb") != 0 || !f)
+    {
+        EVP_PKEY_free(pkey);
+        X509_free(x509);
+        return false;
+    }
+
+    int write_cert_ok = PEM_write_X509(
         f,   /* write the certificate to the file we've opened */
         x509 /* our certificate */
     );
-
     fclose(f);
 
     EVP_PKEY_free(pkey);
     X509_free(x509);
 
-    return true;
+    return write_cert_ok != 0;
 }
 
 X509_REQ* b_create_server_req(int alg)
 {
-    EVP_PKEY* pkey;
+    EVP_PKEY* pkey = NULL;
 
     switch (alg)
     {
@@ -178,15 +202,27 @@ X509_REQ* b_create_server_req(int alg)
     }
 
     X509_REQ* x509req = X509_REQ_new();
+    if (!x509req)
+    {
+        EVP_PKEY_free(pkey);
+        return NULL;
+    }
     X509_REQ_set_version(x509req, 2);
 
     X509_NAME* name = X509_NAME_new();
+    if (!name)
+    {
+        EVP_PKEY_free(pkey);
+        X509_REQ_free(x509req);
+        return NULL;
+    }
     X509_NAME_add_entry_by_txt(name, "C",  MBSTRING_ASC, (unsigned char *)"UA", -1, -1, 0);
     X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC, (unsigned char *)"TLS 1.3 Server", -1, -1, 0);
 
     if (!X509_REQ_set_subject_name(x509req, name))
     {
         fprintf(stderr, "X509_REQ_set_subject_name failed\n");
+        X509_NAME_free(name);
         EVP_PKEY_free(pkey);
         X509_REQ_free(x509req);
 
@@ -218,13 +254,16 @@ X509_REQ* b_create_server_req(int alg)
         break;
 
     default:
+        EVP_PKEY_free(pkey);
+        X509_REQ_free(x509req);
         return NULL;
     }
 
-    if (!err)
+    EVP_PKEY_free(pkey);
+
+    if (err <= 0)
     {
         fprintf(stderr, "X509_REQ_sign failed\n");
-        EVP_PKEY_free(pkey);
         X509_REQ_free(x509req);
 
         return NULL;
@@ -254,6 +293,7 @@ int b_randSerial(ASN1_INTEGER *ai)
         return -1;
     }
 
+    BN_free(p_bignum);
     return 1;
 }
 
@@ -273,64 +313,71 @@ bool b_create_server_cert(X509_REQ* x509req, int alg, FILE *p_ca_cert_file, FILE
 
     if (NULL == (p_ca_pkey = X509_get_pubkey(p_ca_cert)))
     {
+        X509_free(p_ca_cert);
         return false;
     }
 
     if (NULL == (p_ca_key_pkey = PEM_read_PrivateKey(p_ca_key_file, NULL, NULL, NULL)))
     {
+        EVP_PKEY_free(p_ca_pkey);
+        X509_free(p_ca_cert);
         return false;
     }
 
     if (NULL == (p_generated_cert = X509_new()))
     {
+        EVP_PKEY_free(p_ca_key_pkey);
+        EVP_PKEY_free(p_ca_pkey);
+        X509_free(p_ca_cert);
         return false;
     }
 
     X509_set_version(p_generated_cert, 2);
 
     p_serial_number = ASN1_INTEGER_new();
-    b_randSerial(p_serial_number);
-    X509_set_serialNumber(p_generated_cert, p_serial_number);
-
-    X509_set_issuer_name(p_generated_cert, X509_REQ_get_subject_name(x509req));
-    X509_set_subject_name(p_generated_cert, X509_REQ_get_subject_name(x509req));
-
-    X509_gmtime_adj(X509_get_notBefore(p_generated_cert), 0L);
-    X509_gmtime_adj(X509_get_notAfter(p_generated_cert), 31536000L);
-
-    if (!b_add_cert_ext(p_generated_cert, NID_key_usage, (char*)"digitalSignature")
-            || !b_add_cert_ext(p_generated_cert, NID_subject_key_identifier, (char*)"hash"))
+    if (!p_serial_number || b_randSerial(p_serial_number) < 0 || !X509_set_serialNumber(p_generated_cert, p_serial_number))
     {
+        ASN1_INTEGER_free(p_serial_number);
         X509_free(p_generated_cert);
-        p_generated_cert = NULL;
+        EVP_PKEY_free(p_ca_key_pkey);
+        EVP_PKEY_free(p_ca_pkey);
+        X509_free(p_ca_cert);
         return false;
     }
-
-    if (NULL == (p_cert_req_pkey = X509_REQ_get_pubkey(x509req)))
-    {
-        X509_free(p_generated_cert);
-        p_generated_cert = NULL;
-        return false;
-    }
-
-    if (0 > X509_set_pubkey(p_generated_cert, p_cert_req_pkey))
-    {
-        X509_free(p_generated_cert);
-        p_generated_cert = NULL;
-        return false;
-    }
-
-    if (0 > EVP_PKEY_copy_parameters(p_ca_pkey, p_ca_key_pkey))
-    {
-        X509_free(p_generated_cert);
-        p_generated_cert = NULL;
-        return false;
-    }
+    ASN1_INTEGER_free(p_serial_number);
+    p_serial_number = NULL;
 
     X509_set_issuer_name(p_generated_cert, X509_get_subject_name(p_ca_cert));
+    X509_set_subject_name(p_generated_cert, X509_REQ_get_subject_name(x509req));
+
+    X509_gmtime_adj(X509_getm_notBefore(p_generated_cert), 0L);
+    X509_gmtime_adj(X509_getm_notAfter(p_generated_cert), 31536000L);
+
+    p_cert_req_pkey = X509_REQ_get_pubkey(x509req);
+    if (!p_cert_req_pkey || !X509_set_pubkey(p_generated_cert, p_cert_req_pkey))
+    {
+        EVP_PKEY_free(p_cert_req_pkey);
+        X509_free(p_generated_cert);
+        EVP_PKEY_free(p_ca_key_pkey);
+        EVP_PKEY_free(p_ca_pkey);
+        X509_free(p_ca_cert);
+        return false;
+    }
+    EVP_PKEY_free(p_cert_req_pkey);
+    p_cert_req_pkey = NULL;
+
+    if (!b_add_cert_ext(p_generated_cert, NID_key_usage, "digitalSignature", p_ca_cert)
+            || !b_add_cert_ext(p_generated_cert, NID_subject_key_identifier, "hash", p_ca_cert))
+    {
+        X509_free(p_generated_cert);
+        EVP_PKEY_free(p_ca_key_pkey);
+        EVP_PKEY_free(p_ca_pkey);
+        X509_free(p_ca_cert);
+        return false;
+    }
 
     int err = 0;
-    steady_clock::time_point start, stop;
+    high_resolution_clock::time_point start, stop;
 
     switch (alg)
     {
@@ -348,13 +395,19 @@ bool b_create_server_cert(X509_REQ* x509req, int alg, FILE *p_ca_cert_file, FILE
         break;
 
     default:
+        X509_free(p_generated_cert);
+        EVP_PKEY_free(p_ca_key_pkey);
+        EVP_PKEY_free(p_ca_pkey);
+        X509_free(p_ca_cert);
         return false;
     }
 
-    if (0 > err)
+    if (err <= 0)
     {
         X509_free(p_generated_cert);
-        p_generated_cert = NULL;
+        EVP_PKEY_free(p_ca_key_pkey);
+        EVP_PKEY_free(p_ca_pkey);
+        X509_free(p_ca_cert);
         return false;
     }
 
@@ -367,14 +420,13 @@ bool b_create_server_cert(X509_REQ* x509req, int alg, FILE *p_ca_cert_file, FILE
     duration = duration_cast<microseconds>(stop - start);
     time_verify = duration.count();
 
-    if (verif == -1)
+    if (verif <= 0)
         time_verify = 0;
 
+    X509_free(p_generated_cert);
     X509_free(p_ca_cert);
     EVP_PKEY_free(p_ca_pkey);
     EVP_PKEY_free(p_ca_key_pkey);
-    ASN1_INTEGER_free(p_serial_number);
-    EVP_PKEY_free(p_cert_req_pkey);
 
     return true;
 }
