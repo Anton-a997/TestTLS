@@ -574,28 +574,36 @@ bool create_server_cert(X509_REQ* x509req, int alg, const char* p_ca_cert_path, 
 
 int tls_recv_packet(SSL* ssl, char* buf, int max_size)
 {
+    if (!ssl || !buf || max_size <= 0)
+        return 0;
+
     int len = 0;
     char* rd_buf = buf;
 
-    do
+    while ((int)(rd_buf - buf) < max_size)
     {
         len = SSL_read(ssl, rd_buf, max_size - (int)(rd_buf - buf));
-        rd_buf += len;
-    } while (len > 0);
+        if (len > 0)
+            rd_buf += len;
+        else
+            break;
+    }
 
-    if (len < 0)
+    int total_read = (int)(rd_buf - buf);
+    if (total_read > 0)
+        return total_read;
+
+    if (len <= 0)
     {
         int err = SSL_get_error(ssl, len);
 
-        if (err == SSL_ERROR_WANT_READ)
-            return (int)(rd_buf - buf);
-        if (err == SSL_ERROR_WANT_WRITE)
-            return (int)(rd_buf - buf);
+        if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE)
+            return 0;
         if (err == SSL_ERROR_ZERO_RETURN || err == SSL_ERROR_SYSCALL || err == SSL_ERROR_SSL)
             return -err;
     }
 
-    return (int)(rd_buf - buf);
+    return total_read;
 }
 
 int tls_send_packet(SSL* ssl, const char *buf, int size)
