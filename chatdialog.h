@@ -1,10 +1,11 @@
 #ifndef CHATDIALOG_H
 #define CHATDIALOG_H
 
+#include <memory>
+
 #include <QWidget>
 #include <QFileDialog>
 #include <QMessageBox>
-
 #include <QtNetwork/QTcpSocket>
 #include <QtNetwork/QTcpServer>
 
@@ -31,25 +32,22 @@ class ChatDialog : public QWidget
     Q_OBJECT
 
 public:
-    explicit ChatDialog(QTcpSocket *tcp_socket, bool is_server, SSL_CTX *ssl_ctx, QWidget *parent = 0);
-    ~ChatDialog();
+    explicit ChatDialog(QTcpSocket *tcp_socket, bool is_server, const TlsContext &ssl_ctx, QWidget *parent = nullptr);
+    ~ChatDialog() override;
 
 private:
     Ui::ChatDialog *ui;
 
-    KeyPressEater *keyPressEater = 0;
+    KeyPressEater *keyPressEater = nullptr;
 
-    QTcpSocket *tcp_socket = 0;
+    QTcpSocket *tcp_socket = nullptr;
     QString peer_ip;
 
-    SSL *ssl = 0; // объект SSL - используется в течение одной TLS сессии
-    BIO *internal_bio = 0, *network_bio = 0; // буферы для чтения и записи TLS сообщений
+    std::unique_ptr<TlsSession> tls_session;
 
     bool is_server;
-    bool tls_connect = false;
     bool tls_print_cert = false;
 
-    int pub_alg = 0;
     QByteArray recv_buffer;
 
     void flushNetworkBio();
@@ -67,10 +65,10 @@ class KeyPressEater : public QObject
     Q_OBJECT
 
 public:
-    explicit KeyPressEater(QWidget *parent = 0);
+    explicit KeyPressEater(QWidget *parent = nullptr);
 
 protected:
-    bool eventFilter(QObject *obj, QEvent *event);
+    bool eventFilter(QObject *obj, QEvent *event) override;
 
 signals:
     void signalSendMessage();

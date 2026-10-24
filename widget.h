@@ -1,8 +1,9 @@
 #ifndef WIDGET_H
 #define WIDGET_H
 
-#include <QWidget>
+#include <memory>
 
+#include <QWidget>
 #include <QMessageBox>
 #include <QtNetwork/QTcpSocket>
 #include <QtNetwork/QTcpServer>
@@ -20,8 +21,8 @@ class Widget : public QWidget
     Q_OBJECT
 
 public:
-    explicit Widget(QWidget *parent = 0);
-    ~Widget();
+    explicit Widget(QWidget *parent = nullptr);
+    ~Widget() override;
 
 private slots:
     void on_pushButton_clicked();
@@ -43,8 +44,8 @@ private:
 
     QTcpServer *tcp_server = nullptr;
 
-    SSL_CTX *ssl_server_ctx = 0;
-    SSL_CTX *ssl_client_ctx = 0;
+    std::unique_ptr<TlsContext> ssl_server_ctx;
+    std::unique_ptr<TlsContext> ssl_client_ctx;
 
     bool StartServer(); // запуск сервера
     void ConnectToIP(); // подключение клиента

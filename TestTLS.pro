@@ -26,7 +26,6 @@ DEFINES += QT_DEPRECATED_WARNINGS
 SOURCES += \
     benchmark.cpp \
     crypto.cpp \
-    crypto_bench.cpp \
         main.cpp \
         widget.cpp \
     chatdialog.cpp
@@ -34,7 +33,6 @@ SOURCES += \
 HEADERS += \
     benchmark.h \
     crypto.h \
-    crypto_bench.h \
         widget.h \
     chatdialog.h
 

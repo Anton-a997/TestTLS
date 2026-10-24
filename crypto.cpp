@@ -1,78 +1,433 @@
 #include "crypto.h"
 
-#include <stdio.h>
-#include <string.h>
+#include <chrono>
+#include <cstdio>
+#include <cstring>
 
-void init_openssl()
+namespace {
+
+struct FileDeleter
 {
-    OPENSSL_init_ssl(0, NULL);
+    void operator()(FILE *f) const noexcept
+    {
+        if (f)
+            std::fclose(f);
+    }
+};
+
+using FilePtr = std::unique_ptr<FILE, FileDeleter>;
+
+FilePtr openFile(const std::string &path, const char *mode)
+{
+#ifdef _MSC_VER
+    FILE *f = nullptr;
+    if (fopen_s(&f, path.c_str(), mode) != 0)
+        return nullptr;
+    return FilePtr(f);
+#else
+    return FilePtr(std::fopen(path.c_str(), mode));
+#endif
 }
 
-void cleanup_openssl()
+constexpr const char *kDefaultSigAlgs = "ecdsa_secp256r1_sha256:rsa_pss_rsae_sha256:ed25519";
+constexpr const char *kKeylogFilePath = "cert/keylog.log";
+
+} // namespace
+
+// ============================================================================
+// CertificateGenerator
+// ============================================================================
+
+EvpPkeyPtr CertificateGenerator::generateKey(CertAlgorithm alg)
+{
+    EVP_PKEY *pkey = nullptr;
+
+    switch (alg)
+    {
+    case CertAlgorithm::Rsa:
+        pkey = EVP_RSA_gen(3072);
+        break;
+    case CertAlgorithm::Ecdsa:
+        pkey = EVP_EC_gen("prime256v1");
+        break;
+    case CertAlgorithm::Ed25519:
+        pkey = EVP_PKEY_Q_keygen(nullptr, nullptr, "ED25519");
+        break;
+    default:
+        return nullptr;
+    }
+
+    if (!pkey)
+        std::fprintf(stderr, "EVP_PKEY_Q_keygen failed\n");
+
+    return EvpPkeyPtr(pkey);
+}
+
+bool CertificateGenerator::addExtension(X509 *cert, int nid, const char *value, X509 *issuer)
+{
+    if (!cert || !value)
+        return false;
+
+    X509V3_CTX ctx;
+    X509V3_set_ctx_nodb(&ctx);
+    X509V3_set_ctx(&ctx, issuer ? issuer : cert, cert, nullptr, nullptr, 0);
+
+    X509ExtPtr ex(X509V3_EXT_conf_nid(nullptr, &ctx, nid, value));
+    if (!ex)
+        return false;
+
+    return X509_add_ext(cert, ex.get(), -1) != 0;
+}
+
+bool CertificateGenerator::generateRandomSerial(ASN1_INTEGER *serial)
+{
+    if (!serial)
+        return false;
+
+    BignumPtr bn(BN_new());
+    if (!bn)
+        return false;
+
+    if (!BN_rand(bn.get(), 64, 0, 0))
+        return false;
+
+    return BN_to_ASN1_INTEGER(bn.get(), serial) != nullptr;
+}
+
+int CertificateGenerator::signCertificate(X509 *cert, EVP_PKEY *privateKey, CertAlgorithm alg)
+{
+    if (!cert || !privateKey)
+        return 0;
+
+    switch (alg)
+    {
+    case CertAlgorithm::Rsa:
+    case CertAlgorithm::Ecdsa:
+        return X509_sign(cert, privateKey, EVP_sha256());
+    case CertAlgorithm::Ed25519:
+        return X509_sign(cert, privateKey, nullptr);
+    default:
+        return 0;
+    }
+}
+
+bool CertificateGenerator::writePrivateKeyPem(EVP_PKEY *pkey, const std::string &path)
+{
+    FilePtr f = openFile(path, "wb");
+    if (!f)
+        return false;
+
+    return PEM_write_PrivateKey(f.get(), pkey, nullptr, nullptr, 0, nullptr, nullptr) != 0;
+}
+
+bool CertificateGenerator::writeCertificatePem(X509 *cert, const std::string &path)
+{
+    FilePtr f = openFile(path, "wb");
+    if (!f)
+        return false;
+
+    return PEM_write_X509(f.get(), cert) != 0;
+}
+
+bool CertificateGenerator::writeCsrPem(X509_REQ *req, const std::string &path)
+{
+    FilePtr f = openFile(path, "wb");
+    if (!f)
+        return false;
+
+    return PEM_write_X509_REQ(f.get(), req) != 0;
+}
+
+X509Ptr CertificateGenerator::loadCertificate(const std::string &certPath)
+{
+    FilePtr f = openFile(certPath, "r");
+    if (!f)
+        return nullptr;
+
+    return X509Ptr(PEM_read_X509(f.get(), nullptr, nullptr, nullptr));
+}
+
+EvpPkeyPtr CertificateGenerator::loadPrivateKey(const std::string &keyPath)
+{
+    FilePtr f = openFile(keyPath, "r");
+    if (!f)
+        return nullptr;
+
+    return EvpPkeyPtr(PEM_read_PrivateKey(f.get(), nullptr, nullptr, nullptr));
+}
+
+EvpPkeyPtr CertificateGenerator::extractPublicKey(X509 *cert)
+{
+    if (!cert)
+        return nullptr;
+
+    return EvpPkeyPtr(X509_get_pubkey(cert));
+}
+
+bool CertificateGenerator::generateCaCertificate(CertAlgorithm alg, const std::string &certPath, const std::string &keyPath)
+{
+    EvpPkeyPtr pkey = generateKey(alg);
+    if (!pkey)
+        return false;
+
+    X509Ptr x509(X509_new());
+    if (!x509)
+        return false;
+
+    ASN1_INTEGER_set(X509_get_serialNumber(x509.get()), 1);
+    X509_gmtime_adj(X509_getm_notBefore(x509.get()), 0);
+    X509_gmtime_adj(X509_getm_notAfter(x509.get()), 31536000L);
+    X509_set_version(x509.get(), 2);
+
+    if (!X509_set_pubkey(x509.get(), pkey.get()))
+    {
+        std::fprintf(stderr, "X509_set_pubkey failed\n");
+        return false;
+    }
+
+    X509_NAME *name = X509_get_subject_name(x509.get());
+    X509_NAME_add_entry_by_txt(name, "C",  MBSTRING_ASC, reinterpret_cast<const unsigned char *>("UA"), -1, -1, 0);
+    X509_NAME_add_entry_by_txt(name, "O",  MBSTRING_ASC, reinterpret_cast<const unsigned char *>("CA"), -1, -1, 0);
+    X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC, reinterpret_cast<const unsigned char *>("CA"), -1, -1, 0);
+    X509_set_issuer_name(x509.get(), name);
+
+    if (!addExtension(x509.get(), NID_basic_constraints, "CA:TRUE")
+            || !addExtension(x509.get(), NID_key_usage, "keyCertSign,cRLSign")
+            || !addExtension(x509.get(), NID_subject_key_identifier, "hash")
+            || !addExtension(x509.get(), NID_authority_key_identifier, "keyid:always"))
+    {
+        std::fprintf(stderr, "addExtension failed\n");
+        return false;
+    }
+
+    if (signCertificate(x509.get(), pkey.get(), alg) <= 0)
+    {
+        std::fprintf(stderr, "X509_sign failed\n");
+        return false;
+    }
+
+    if (!writePrivateKeyPem(pkey.get(), keyPath))
+        return false;
+
+    if (!writeCertificatePem(x509.get(), certPath))
+        return false;
+
+    return true;
+}
+
+X509ReqPtr CertificateGenerator::createServerCsr(CertAlgorithm alg, const std::string &reqPath, const std::string &keyPath)
+{
+    EvpPkeyPtr pkey = generateKey(alg);
+    if (!pkey)
+        return nullptr;
+
+    X509ReqPtr x509req(X509_REQ_new());
+    if (!x509req)
+        return nullptr;
+
+    X509_REQ_set_version(x509req.get(), 2);
+
+    X509NamePtr name(X509_NAME_new());
+    if (!name)
+        return nullptr;
+
+    X509_NAME_add_entry_by_txt(name.get(), "C",  MBSTRING_ASC, reinterpret_cast<const unsigned char *>("UA"), -1, -1, 0);
+    X509_NAME_add_entry_by_txt(name.get(), "CN", MBSTRING_ASC, reinterpret_cast<const unsigned char *>("TLS 1.3 Server"), -1, -1, 0);
+
+    if (!X509_REQ_set_subject_name(x509req.get(), name.get()))
+    {
+        std::fprintf(stderr, "X509_REQ_set_subject_name failed\n");
+        return nullptr;
+    }
+
+    if (!X509_REQ_set_pubkey(x509req.get(), pkey.get()))
+    {
+        std::fprintf(stderr, "X509_REQ_set_pubkey failed\n");
+        return nullptr;
+    }
+
+    int err = 0;
+    switch (alg)
+    {
+    case CertAlgorithm::Rsa:
+    case CertAlgorithm::Ecdsa:
+        err = X509_REQ_sign(x509req.get(), pkey.get(), EVP_sha256());
+        break;
+    case CertAlgorithm::Ed25519:
+        err = X509_REQ_sign(x509req.get(), pkey.get(), nullptr);
+        break;
+    default:
+        return nullptr;
+    }
+
+    if (err <= 0)
+    {
+        std::fprintf(stderr, "X509_REQ_sign failed\n");
+        return nullptr;
+    }
+
+    if (!keyPath.empty() && !writePrivateKeyPem(pkey.get(), keyPath))
+        return nullptr;
+
+    if (!reqPath.empty() && !writeCsrPem(x509req.get(), reqPath))
+        return nullptr;
+
+    return x509req;
+}
+
+X509Ptr CertificateGenerator::buildUnsignedServerCertificate(X509_REQ *csr, X509 *caCert)
+{
+    if (!csr || !caCert)
+        return nullptr;
+
+    X509Ptr cert(X509_new());
+    if (!cert)
+        return nullptr;
+
+    X509_set_version(cert.get(), 2);
+
+    Asn1IntegerPtr serial(ASN1_INTEGER_new());
+    if (!serial || !generateRandomSerial(serial.get()) || !X509_set_serialNumber(cert.get(), serial.get()))
+        return nullptr;
+
+    X509_set_issuer_name(cert.get(), X509_get_subject_name(caCert));
+    X509_set_subject_name(cert.get(), X509_REQ_get_subject_name(csr));
+
+    X509_gmtime_adj(X509_getm_notBefore(cert.get()), 0L);
+    X509_gmtime_adj(X509_getm_notAfter(cert.get()), 31536000L);
+
+    EvpPkeyPtr reqPubKey(X509_REQ_get_pubkey(csr));
+    if (!reqPubKey || !X509_set_pubkey(cert.get(), reqPubKey.get()))
+        return nullptr;
+
+    if (!addExtension(cert.get(), NID_key_usage, "digitalSignature", caCert)
+            || !addExtension(cert.get(), NID_subject_key_identifier, "hash", caCert))
+    {
+        return nullptr;
+    }
+
+    return cert;
+}
+
+bool CertificateGenerator::createServerCertificate(X509_REQ *csr, CertAlgorithm alg, const std::string &caCertPath, const std::string &caKeyPath, const std::string &serverCertPath)
+{
+    X509Ptr caCert = loadCertificate(caCertPath);
+    if (!caCert)
+        return false;
+
+    EvpPkeyPtr caPrivateKey = loadPrivateKey(caKeyPath);
+    if (!caPrivateKey)
+        return false;
+
+    X509Ptr serverCert = buildUnsignedServerCertificate(csr, caCert.get());
+    if (!serverCert)
+        return false;
+
+    if (signCertificate(serverCert.get(), caPrivateKey.get(), alg) <= 0)
+        return false;
+
+    return writeCertificatePem(serverCert.get(), serverCertPath);
+}
+
+bool CertificateGenerator::generateServerCertificateChain(CertAlgorithm alg, const std::string &caCertPath, const std::string &caKeyPath, const std::string &serverReqPath, const std::string &serverKeyPath, const std::string &serverCertPath)
+{
+    if (!generateCaCertificate(alg, caCertPath, caKeyPath))
+        return false;
+
+    X509ReqPtr csr = createServerCsr(alg, serverReqPath, serverKeyPath);
+    if (!csr)
+        return false;
+
+    return createServerCertificate(csr.get(), alg, caCertPath, caKeyPath, serverCertPath);
+}
+
+bool CertificateGenerator::benchmarkSignAndVerify(X509_REQ *csr, CertAlgorithm alg, X509 *caCert, EVP_PKEY *caPublicKey, EVP_PKEY *caPrivateKey, long long &signTimeUs, long long &verifyTimeUs)
+{
+    using namespace std::chrono;
+
+    if (!csr || !caCert || !caPublicKey || !caPrivateKey)
+        return false;
+
+    X509Ptr cert = buildUnsignedServerCertificate(csr, caCert);
+    if (!cert)
+        return false;
+
+    auto start = high_resolution_clock::now();
+    int signResult = signCertificate(cert.get(), caPrivateKey, alg);
+    auto stop = high_resolution_clock::now();
+
+    if (signResult <= 0)
+        return false;
+
+    signTimeUs = duration_cast<microseconds>(stop - start).count();
+
+    start = high_resolution_clock::now();
+    int verifyResult = X509_verify(cert.get(), caPublicKey);
+    stop = high_resolution_clock::now();
+
+    verifyTimeUs = (verifyResult > 0) ? duration_cast<microseconds>(stop - start).count() : 0;
+    return true;
+}
+
+// ============================================================================
+// TlsContext
+// ============================================================================
+
+TlsContext::TlsContext(SslCtxPtr ctx)
+    : m_ctx(std::move(ctx))
 {
 }
 
-SSL_CTX *create_server_context(const char *alg_string)
+void TlsContext::initializeOpenSsl()
 {
-    const SSL_METHOD *method;
-    SSL_CTX *ctx;
-
-    method = TLS_server_method(); // TLS сервер
-    ctx = SSL_CTX_new(method); // контекст SSL
-
-    SSL_CTX_set_min_proto_version(ctx, TLS1_3_VERSION); // TLS 1.3
-    SSL_CTX_set1_sigalgs_list(ctx, "ecdsa_secp256r1_sha256:rsa_pss_rsae_sha256:ed25519"); // алгоритмы подписи
-    SSL_CTX_set_ciphersuites(ctx, alg_string); // алгоритм шифрования сессии
-
-    return ctx;
+    OPENSSL_init_ssl(0, nullptr);
 }
 
-SSL_CTX *create_client_context(bool use_keylog)
+std::unique_ptr<TlsContext> TlsContext::createServerContext(const std::string &cipherSuite)
 {
-    const SSL_METHOD *method;
-    SSL_CTX *ctx;
+    const SSL_METHOD *method = TLS_server_method();
+    SslCtxPtr ctx(SSL_CTX_new(method));
+    if (!ctx)
+        return nullptr;
 
-    method = TLS_client_method(); // TLS клиент
-    ctx = SSL_CTX_new(method); // контекст SSL
+    SSL_CTX_set_min_proto_version(ctx.get(), TLS1_3_VERSION);
+    SSL_CTX_set1_sigalgs_list(ctx.get(), kDefaultSigAlgs);
+    if (!cipherSuite.empty())
+        SSL_CTX_set_ciphersuites(ctx.get(), cipherSuite.c_str());
 
-    remove("cert\\keylog.log"); // файл с данными хендшейка для Wireshark
-
-    SSL_CTX_set_min_proto_version(ctx, TLS1_3_VERSION); // TLS 1.3
-    SSL_CTX_set1_sigalgs_list(ctx, "ecdsa_secp256r1_sha256:rsa_pss_rsae_sha256:ed25519"); // алгоритмы подписи
-
-    if (use_keylog)
-        SSL_CTX_set_keylog_callback(ctx, keylog_callback); // callback для записи хендшейка в keylog
-
-    return ctx;
+    return std::unique_ptr<TlsContext>(new TlsContext(std::move(ctx)));
 }
 
-const char *EVP_PKEY_get_type_name(EVP_PKEY *pubkey)
+std::unique_ptr<TlsContext> TlsContext::createClientContext(bool enableKeylog)
 {
-    return EVP_PKEY_get0_type_name(pubkey);
+    const SSL_METHOD *method = TLS_client_method();
+    SslCtxPtr ctx(SSL_CTX_new(method));
+    if (!ctx)
+        return nullptr;
+
+    std::remove(kKeylogFilePath);
+
+    SSL_CTX_set_min_proto_version(ctx.get(), TLS1_3_VERSION);
+    SSL_CTX_set1_sigalgs_list(ctx.get(), kDefaultSigAlgs);
+
+    if (enableKeylog)
+        SSL_CTX_set_keylog_callback(ctx.get(), &TlsContext::keylogCallback);
+
+    return std::unique_ptr<TlsContext>(new TlsContext(std::move(ctx)));
 }
 
-void keylog_callback(const SSL*, const char *line)
+bool TlsContext::loadCertificateAndKey(const std::string &certPath, const std::string &keyPath)
 {
-    FILE* of;
+    if (!m_ctx)
+        return false;
 
-    if (fopen_s(&of, "cert\\keylog.log", "a") != 0)
-        return;
-
-    fprintf_s(of, "%s\n", line);
-    fclose(of);
-}
-
-bool load_server_cert(SSL_CTX *ctx, const char* cert_path, const char* key_path)
-{
-    // загрузка серт сервера
-    if (SSL_CTX_use_certificate_file(ctx, cert_path, SSL_FILETYPE_PEM) <= 0)
+    if (SSL_CTX_use_certificate_file(m_ctx.get(), certPath.c_str(), SSL_FILETYPE_PEM) <= 0)
     {
         ERR_print_errors_fp(stderr);
         return false;
     }
 
-    // загрузка ключа сервера
-    if (SSL_CTX_use_PrivateKey_file(ctx, key_path, SSL_FILETYPE_PEM) <= 0 )
+    if (SSL_CTX_use_PrivateKey_file(m_ctx.get(), keyPath.c_str(), SSL_FILETYPE_PEM) <= 0)
     {
         ERR_print_errors_fp(stderr);
         return false;
@@ -81,546 +436,247 @@ bool load_server_cert(SSL_CTX *ctx, const char* cert_path, const char* key_path)
     return true;
 }
 
-// добавление расширений сертификата (назначение, использование...)
-int add_cert_ext(X509 *cert, int nid, const char *value, X509 *issuer = NULL)
+void TlsContext::keylogCallback(const SSL * /*ssl*/, const char *line)
 {
-    X509_EXTENSION *ex;
-    X509V3_CTX ctx;
+    if (!line)
+        return;
 
-    /* This sets the 'context' of the extensions. */
-    /* No configuration database */
-    X509V3_set_ctx_nodb(&ctx);
+    FilePtr f = openFile(kKeylogFilePath, "a");
+    if (!f)
+        return;
 
-    /* Issuer and subject certs: both the target if self signed,
-     * no request and no CRL
-     */
-    X509V3_set_ctx(&ctx, issuer ? issuer : cert, cert, NULL, NULL, 0);
-    ex = X509V3_EXT_conf_nid(NULL, &ctx, nid, value);
+    std::fprintf(f.get(), "%s\n", line);
+}
 
-    if (!ex)
+// ============================================================================
+// TlsSession
+// ============================================================================
+
+TlsSession::TlsSession(const TlsContext &context, bool isServer)
+    : m_isServer(isServer)
+{
+    if (!context.nativeHandle())
+        return;
+
+    SslPtr ssl(SSL_new(context.nativeHandle()));
+    if (!ssl)
+        return;
+
+    BIO *internalBio = nullptr;
+    BIO *networkBio = nullptr;
+    if (!BIO_new_bio_pair(&internalBio, 0, &networkBio, 0))
+        return;
+
+    SSL_set_bio(ssl.get(), internalBio, internalBio);
+    m_ssl = std::move(ssl);
+    m_networkBio.reset(networkBio);
+}
+
+TlsSession::TlsSession(SslPtr ssl, BioPtr networkBio, bool isServer)
+    : m_ssl(std::move(ssl))
+    , m_networkBio(std::move(networkBio))
+    , m_isServer(isServer)
+{
+}
+
+TlsSession::~TlsSession()
+{
+    if (m_ssl)
+        SSL_shutdown(m_ssl.get());
+}
+
+bool TlsSession::createConnectedPair(const TlsContext &clientCtx, const TlsContext &serverCtx, std::unique_ptr<TlsSession> &clientSession, std::unique_ptr<TlsSession> &serverSession)
+{
+    if (!clientCtx.nativeHandle() || !serverCtx.nativeHandle())
+        return false;
+
+    SslPtr clientSsl(SSL_new(clientCtx.nativeHandle()));
+    SslPtr serverSsl(SSL_new(serverCtx.nativeHandle()));
+    if (!clientSsl || !serverSsl)
+        return false;
+
+    BIO *clientBio = nullptr;
+    BIO *serverBio = nullptr;
+    if (!BIO_new_bio_pair(&clientBio, 0, &serverBio, 0))
+        return false;
+
+    SSL_set_bio(clientSsl.get(), clientBio, clientBio);
+    SSL_set_bio(serverSsl.get(), serverBio, serverBio);
+
+    clientSession.reset(new TlsSession(std::move(clientSsl), nullptr, false));
+    serverSession.reset(new TlsSession(std::move(serverSsl), nullptr, true));
+    return true;
+}
+
+bool TlsSession::performInMemoryHandshake(TlsSession &clientSession, TlsSession &serverSession, long long &handshakeTimeUs)
+{
+    using namespace std::chrono;
+
+    if (!clientSession.isValid() || !serverSession.isValid())
+        return false;
+
+    auto start = high_resolution_clock::now();
+
+    while (!clientSession.isHandshakeCompleted() || !serverSession.isHandshakeCompleted())
+    {
+        if (!clientSession.isHandshakeCompleted())
+        {
+            if (clientSession.stepHandshake() == HandshakeStatus::Failed)
+                return false;
+        }
+
+        if (!serverSession.isHandshakeCompleted())
+        {
+            if (serverSession.stepHandshake() == HandshakeStatus::Failed)
+                return false;
+        }
+    }
+
+    auto stop = high_resolution_clock::now();
+    handshakeTimeUs = duration_cast<microseconds>(stop - start).count();
+    return true;
+}
+
+HandshakeStatus TlsSession::stepHandshake(int *outSslError)
+{
+    if (!m_ssl)
+        return HandshakeStatus::Failed;
+
+    if (m_handshakeCompleted)
+        return HandshakeStatus::Completed;
+
+    int status = m_isServer ? SSL_accept(m_ssl.get()) : SSL_connect(m_ssl.get());
+    if (status == 1)
+    {
+        m_handshakeCompleted = true;
+        return HandshakeStatus::Completed;
+    }
+
+    int err = SSL_get_error(m_ssl.get(), status);
+    if (outSslError)
+        *outSslError = err;
+
+    if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE)
+        return HandshakeStatus::InProgress;
+
+    return HandshakeStatus::Failed;
+}
+
+void TlsSession::feedIncomingData(const char *data, int size)
+{
+    if (!m_networkBio || !data || size <= 0)
+        return;
+
+    BIO_write(m_networkBio.get(), data, size);
+}
+
+std::vector<char> TlsSession::takeOutgoingData()
+{
+    std::vector<char> output;
+    if (!m_networkBio)
+        return output;
+
+    char buf[4096];
+    int bread = 0;
+    while ((bread = BIO_read(m_networkBio.get(), buf, sizeof(buf))) > 0)
+    {
+        output.insert(output.end(), buf, buf + bread);
+    }
+
+    return output;
+}
+
+int TlsSession::sendApplicationData(const char *data, int size)
+{
+    if (!m_ssl || !data || size <= 0)
         return 0;
 
-    int ok = X509_add_ext(cert, ex, -1);
-    X509_EXTENSION_free(ex);
-
-    return ok;
-}
-
-bool create_ca_cert(int alg, const char *fname_cert, const char *fname_key)
-{
-    EVP_PKEY* pkey = NULL;
-
-    // выбор алгоритма серт и генерация ключа
-    switch (alg)
+    int len = SSL_write(m_ssl.get(), data, size);
+    if (len < 0)
     {
-    case CERT_RSA:
-        pkey = EVP_RSA_gen(3072);
-        break;
-
-    case CERT_ECDSA:
-        pkey = EVP_EC_gen("prime256v1");
-        break;
-
-    case CERT_ED25519:
-        pkey = EVP_PKEY_Q_keygen(NULL, NULL, "ED25519");
-        break;
-
-    default:
-        return false;
-    }
-
-    if (!pkey)
-    {
-        fprintf(stderr, "EVP_PKEY_Q_keygen failed\n");
-        return false;
-    }
-
-    X509* x509 = X509_new(); // создание серт
-    if (!x509)
-    {
-        EVP_PKEY_free(pkey);
-        return false;
-    }
-
-    ASN1_INTEGER_set(X509_get_serialNumber(x509), 1); // серийный номер
-    X509_gmtime_adj(X509_getm_notBefore(x509), 0); // действует с
-    X509_gmtime_adj(X509_getm_notAfter(x509), 31536000L); // действует по
-    X509_set_version(x509, 2); // версия V3
-
-    // задаем открытый ключ
-    if (!X509_set_pubkey(x509, pkey))
-    {
-        fprintf(stderr, "X509_set_pubkey failed\n");
-        EVP_PKEY_free(pkey);
-        X509_free(x509);
-
-        return false;
-    }
-
-    // имя, организация...
-    X509_NAME* name = X509_get_subject_name(x509);
-    X509_NAME_add_entry_by_txt(name, "C",  MBSTRING_ASC, (unsigned char *)"UA", -1, -1, 0);
-    X509_NAME_add_entry_by_txt(name, "O",  MBSTRING_ASC, (unsigned char *)"CA", -1, -1, 0);
-    X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC, (unsigned char *)"CA", -1, -1, 0);
-    X509_set_issuer_name(x509, name);
-
-    // расширения сертификата
-    if (!add_cert_ext(x509, NID_basic_constraints, "CA:TRUE")
-            || !add_cert_ext(x509, NID_key_usage, "keyCertSign,cRLSign")
-            || !add_cert_ext(x509, NID_subject_key_identifier, "hash")
-            || !add_cert_ext(x509, NID_authority_key_identifier, "keyid:always"))
-    {
-        fprintf(stderr, "add_cert_ext failed\n");
-        EVP_PKEY_free(pkey);
-        X509_free(x509);
-
-        return false;
-    }
-
-    int err = 0;
-
-    // алгоритм хеширования подписи
-    switch (alg)
-    {
-    case CERT_RSA:
-    case CERT_ECDSA:
-        err = X509_sign(x509, pkey, EVP_sha256());
-        break;
-
-    case CERT_ED25519:
-        err = X509_sign(x509, pkey, NULL);
-        break;
-
-    default:
-        EVP_PKEY_free(pkey);
-        X509_free(x509);
-        return false;
-    }
-
-    if (err <= 0)
-    {
-        fprintf(stderr, "X509_sign failed\n");
-        EVP_PKEY_free(pkey);
-        X509_free(x509);
-
-        return false;
-    }
-
-    // сохранение в файл
-    FILE * f = NULL;
-    if (fopen_s(&f, fname_key, "wb") != 0 || !f)
-    {
-        EVP_PKEY_free(pkey);
-        X509_free(x509);
-        return false;
-    }
-
-    int write_key_ok = PEM_write_PrivateKey(
-        f,                  /* write the key to the file we've opened */
-        pkey,               /* our key from earlier */
-        NULL,               /* default cipher for encrypting the key on disk */
-        NULL,               /* passphrase required for decrypting the key on disk */
-        0,                  /* length of the passphrase string */
-        NULL,               /* callback for requesting a password */
-        NULL                /* data to pass to the callback */
-    );
-    fclose(f);
-
-    if (!write_key_ok)
-    {
-        EVP_PKEY_free(pkey);
-        X509_free(x509);
-        return false;
-    }
-
-    if (fopen_s(&f, fname_cert, "wb") != 0 || !f)
-    {
-        EVP_PKEY_free(pkey);
-        X509_free(x509);
-        return false;
-    }
-
-    int write_cert_ok = PEM_write_X509(
-        f,   /* write the certificate to the file we've opened */
-        x509 /* our certificate */
-    );
-    fclose(f);
-
-    EVP_PKEY_free(pkey);
-    X509_free(x509);
-
-    return write_cert_ok != 0;
-}
-
-X509_REQ* create_server_req(int alg, const char *fname_req, const char *fname_key)
-{
-    EVP_PKEY* pkey = NULL;
-
-    // генерация ключа
-    switch (alg)
-    {
-    case CERT_RSA:
-        pkey = EVP_RSA_gen(3072);
-        break;
-
-    case CERT_ECDSA:
-        pkey = EVP_EC_gen("prime256v1");
-        break;
-
-    case CERT_ED25519:
-        pkey = EVP_PKEY_Q_keygen(NULL, NULL, "ED25519");
-        break;
-
-    default:
-        return NULL;
-    }
-
-    if (!pkey)
-    {
-        fprintf(stderr, "EVP_PKEY_Q_keygen failed\n");
-        return NULL;
-    }
-
-    // создания серт запроса
-    X509_REQ* x509req = X509_REQ_new();
-    if (!x509req)
-    {
-        EVP_PKEY_free(pkey);
-        return NULL;
-    }
-    X509_REQ_set_version(x509req, 2);
-
-    // имя, страна...
-    X509_NAME* name = X509_NAME_new();
-    if (!name)
-    {
-        EVP_PKEY_free(pkey);
-        X509_REQ_free(x509req);
-        return NULL;
-    }
-    X509_NAME_add_entry_by_txt(name, "C",  MBSTRING_ASC, (unsigned char *)"UA", -1, -1, 0);
-    X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC, (unsigned char *)"TLS 1.3 Server", -1, -1, 0);
-
-    // установка имени
-    if (!X509_REQ_set_subject_name(x509req, name))
-    {
-        fprintf(stderr, "X509_REQ_set_subject_name failed\n");
-        X509_NAME_free(name);
-        EVP_PKEY_free(pkey);
-        X509_REQ_free(x509req);
-
-        return NULL;
-    }
-
-    X509_NAME_free(name);
-
-    // установка открытого ключа
-    if (!X509_REQ_set_pubkey(x509req, pkey))
-    {
-        fprintf(stderr, "X509_REQ_set_pubkey failed\n");
-        EVP_PKEY_free(pkey);
-        X509_REQ_free(x509req);
-
-        return NULL;
-    }
-
-    int err = 0;
-
-    // алгоритм хеширования
-    switch (alg)
-    {
-    case CERT_RSA:
-    case CERT_ECDSA:
-        err = X509_REQ_sign(x509req, pkey, EVP_sha256());
-        break;
-
-    case CERT_ED25519:
-        err = X509_REQ_sign(x509req, pkey, NULL);
-        break;
-
-    default:
-        EVP_PKEY_free(pkey);
-        X509_REQ_free(x509req);
-        return NULL;
-    }
-
-    if (err <= 0)
-    {
-        fprintf(stderr, "X509_REQ_sign failed\n");
-        EVP_PKEY_free(pkey);
-        X509_REQ_free(x509req);
-
-        return NULL;
-    }
-
-    // запись в файл
-    FILE * f = NULL;
-    if (fopen_s(&f, fname_key, "wb") != 0 || !f)
-    {
-        EVP_PKEY_free(pkey);
-        X509_REQ_free(x509req);
-        return NULL;
-    }
-
-    int write_key_ok = PEM_write_PrivateKey(
-        f,                  /* write the key to the file we've opened */
-        pkey,               /* our key from earlier */
-        NULL,               /* default cipher for encrypting the key on disk */
-        NULL,               /* passphrase required for decrypting the key on disk */
-        0,                  /* length of the passphrase string */
-        NULL,               /* callback for requesting a password */
-        NULL                /* data to pass to the callback */
-    );
-    fclose(f);
-
-    if (!write_key_ok)
-    {
-        EVP_PKEY_free(pkey);
-        X509_REQ_free(x509req);
-        return NULL;
-    }
-
-    if (fopen_s(&f, fname_req, "wb") != 0 || !f)
-    {
-        EVP_PKEY_free(pkey);
-        X509_REQ_free(x509req);
-        return NULL;
-    }
-
-    int write_req_ok = PEM_write_X509_REQ(
-        f,      /* write the certificate to the file we've opened */
-        x509req /* our certificate */
-    );
-    fclose(f);
-
-    EVP_PKEY_free(pkey);
-
-    if (!write_req_ok)
-    {
-        X509_REQ_free(x509req);
-        return NULL;
-    }
-
-    return x509req;
-}
-
-// генерация серийного номера
-int randSerial(ASN1_INTEGER *ai)
-{
-    BIGNUM *p_bignum = NULL;
-
-    if (NULL == (p_bignum = BN_new()))
-    {
-        return -1;
-    }
-
-    if (!BN_rand(p_bignum, 64, 0, 0))
-    {
-        BN_free(p_bignum);
-        return -1;
-    }
-
-    if (ai && !BN_to_ASN1_INTEGER(p_bignum, ai))
-    {
-        BN_free(p_bignum);
-        return -1;
-    }
-
-    BN_free(p_bignum);
-    return 1;
-}
-
-bool create_server_cert(X509_REQ* x509req, int alg, const char* p_ca_cert_path, const char* p_ca_key_path, const char* fname_serv_cert)
-{
-    FILE *p_ca_cert_file = NULL;
-    X509 *p_ca_cert = NULL;
-    FILE *p_ca_key_file = NULL;
-    EVP_PKEY *p_ca_key_pkey = NULL;
-    X509 *p_generated_cert = NULL;
-    ASN1_INTEGER *p_serial_number = NULL;
-    EVP_PKEY *p_cert_req_pkey = NULL;
-
-    // чтение серт ЦС
-    if (fopen_s(&p_ca_cert_file, p_ca_cert_path, "r") != 0 || !p_ca_cert_file)
-    {
-        return false;
-    }
-
-    p_ca_cert = PEM_read_X509(p_ca_cert_file, NULL, 0, NULL);
-    fclose(p_ca_cert_file);
-    if (!p_ca_cert)
-    {
-        return false;
-    }
-
-    if (fopen_s(&p_ca_key_file, p_ca_key_path, "r") != 0 || !p_ca_key_file)
-    {
-        X509_free(p_ca_cert);
-        return false;
-    }
-
-    // чтение закрытого ключа ЦС
-    p_ca_key_pkey = PEM_read_PrivateKey(p_ca_key_file, NULL, NULL, NULL);
-    fclose(p_ca_key_file);
-    if (!p_ca_key_pkey)
-    {
-        X509_free(p_ca_cert);
-        return false;
-    }
-
-    // новый серт
-    p_generated_cert = X509_new();
-    if (!p_generated_cert)
-    {
-        X509_free(p_ca_cert);
-        EVP_PKEY_free(p_ca_key_pkey);
-        return false;
-    }
-
-    X509_set_version(p_generated_cert, 2); // версия V3
-
-    p_serial_number = ASN1_INTEGER_new(); // серийный номер
-    if (!p_serial_number || randSerial(p_serial_number) < 0 || !X509_set_serialNumber(p_generated_cert, p_serial_number))
-    {
-        ASN1_INTEGER_free(p_serial_number);
-        X509_free(p_generated_cert);
-        X509_free(p_ca_cert);
-        EVP_PKEY_free(p_ca_key_pkey);
-        return false;
-    }
-    ASN1_INTEGER_free(p_serial_number);
-    p_serial_number = NULL;
-
-    X509_set_issuer_name(p_generated_cert, X509_get_subject_name(p_ca_cert)); // выдан кем
-    X509_set_subject_name(p_generated_cert, X509_REQ_get_subject_name(x509req)); // выдан кому
-
-    X509_gmtime_adj(X509_getm_notBefore(p_generated_cert), 0L); // действует от
-    X509_gmtime_adj(X509_getm_notAfter(p_generated_cert), 31536000L); // действует до
-
-    // установка открытого ключа серт сервера из сертификата REQ
-    p_cert_req_pkey = X509_REQ_get_pubkey(x509req);
-    if (!p_cert_req_pkey || !X509_set_pubkey(p_generated_cert, p_cert_req_pkey))
-    {
-        EVP_PKEY_free(p_cert_req_pkey);
-        X509_free(p_generated_cert);
-        X509_free(p_ca_cert);
-        EVP_PKEY_free(p_ca_key_pkey);
-        return false;
-    }
-    EVP_PKEY_free(p_cert_req_pkey);
-    p_cert_req_pkey = NULL;
-
-    // расширения
-    if (!add_cert_ext(p_generated_cert, NID_key_usage, "digitalSignature", p_ca_cert)
-            || !add_cert_ext(p_generated_cert, NID_subject_key_identifier, "hash", p_ca_cert))
-    {
-        X509_free(p_generated_cert);
-        X509_free(p_ca_cert);
-        EVP_PKEY_free(p_ca_key_pkey);
-        return false;
-    }
-
-    int err = 0;
-
-    // подписание серт сервера
-    switch (alg)
-    {
-    case CERT_RSA:
-    case CERT_ECDSA:
-        err = X509_sign(p_generated_cert, p_ca_key_pkey, EVP_sha256());
-        break;
-
-    case CERT_ED25519:
-        err = X509_sign(p_generated_cert, p_ca_key_pkey, NULL);
-        break;
-
-    default:
-        X509_free(p_generated_cert);
-        X509_free(p_ca_cert);
-        EVP_PKEY_free(p_ca_key_pkey);
-        return false;
-    }
-
-    if (err <= 0)
-    {
-        X509_free(p_generated_cert);
-        X509_free(p_ca_cert);
-        EVP_PKEY_free(p_ca_key_pkey);
-        return false;
-    }
-
-    // запись в файл
-    FILE * f = NULL;
-    if (fopen_s(&f, fname_serv_cert, "wb") != 0 || !f)
-    {
-        X509_free(p_generated_cert);
-        X509_free(p_ca_cert);
-        EVP_PKEY_free(p_ca_key_pkey);
-        return false;
-    }
-
-    int write_ok = PEM_write_X509(
-        f,
-        p_generated_cert
-    );
-    fclose(f);
-
-    X509_free(p_generated_cert);
-    X509_free(p_ca_cert);
-    EVP_PKEY_free(p_ca_key_pkey);
-
-    return write_ok != 0;
-}
-
-int tls_recv_packet(SSL* ssl, char* buf, int max_size)
-{
-    if (!ssl || !buf || max_size <= 0)
-        return 0;
-
-    int len = 0;
-    char* rd_buf = buf;
-
-    while ((int)(rd_buf - buf) < max_size)
-    {
-        len = SSL_read(ssl, rd_buf, max_size - (int)(rd_buf - buf));
-        if (len > 0)
-            rd_buf += len;
-        else
-            break;
-    }
-
-    int total_read = (int)(rd_buf - buf);
-    if (total_read > 0)
-        return total_read;
-
-    if (len <= 0)
-    {
-        int err = SSL_get_error(ssl, len);
-
+        int err = SSL_get_error(m_ssl.get(), len);
         if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE)
             return 0;
         if (err == SSL_ERROR_ZERO_RETURN || err == SSL_ERROR_SYSCALL || err == SSL_ERROR_SSL)
             return -err;
     }
 
-    return total_read;
+    return len;
 }
 
-int tls_send_packet(SSL* ssl, const char *buf, int size)
+int TlsSession::receiveApplicationData(char *buf, int maxSize)
 {
-    int len = SSL_write(ssl, buf, size);
+    if (!m_ssl || !buf || maxSize <= 0)
+        return 0;
 
-    if (len < 0)
+    int len = 0;
+    char *rdBuf = buf;
+
+    while (static_cast<int>(rdBuf - buf) < maxSize)
     {
-        int err = SSL_get_error(ssl, len);
+        len = SSL_read(m_ssl.get(), rdBuf, maxSize - static_cast<int>(rdBuf - buf));
+        if (len > 0)
+            rdBuf += len;
+        else
+            break;
+    }
 
-        if (err == SSL_ERROR_WANT_READ)
-            return 0;
-        if (err == SSL_ERROR_WANT_WRITE)
+    int totalRead = static_cast<int>(rdBuf - buf);
+    if (totalRead > 0)
+        return totalRead;
+
+    if (len <= 0)
+    {
+        int err = SSL_get_error(m_ssl.get(), len);
+        if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE)
             return 0;
         if (err == SSL_ERROR_ZERO_RETURN || err == SSL_ERROR_SYSCALL || err == SSL_ERROR_SSL)
             return -err;
     }
 
-    return len;
+    return totalRead;
+}
+
+PeerCertificateInfo TlsSession::peerCertificateInfo() const
+{
+    PeerCertificateInfo info;
+    if (!m_ssl)
+        return info;
+
+    X509Ptr cert(SSL_get1_peer_certificate(m_ssl.get()));
+    if (!cert)
+        return info;
+
+    info.valid = true;
+
+    if (char *subj = X509_NAME_oneline(X509_get_subject_name(cert.get()), nullptr, 0))
+    {
+        info.subject = subj;
+        OPENSSL_free(subj);
+    }
+
+    if (char *iss = X509_NAME_oneline(X509_get_issuer_name(cert.get()), nullptr, 0))
+    {
+        info.issuer = iss;
+        OPENSSL_free(iss);
+    }
+
+    info.version = X509_get_version(cert.get()) + 1;
+
+    EvpPkeyPtr pubkey(X509_get_pubkey(cert.get()));
+    if (pubkey)
+    {
+        const char *typeName = EVP_PKEY_get0_type_name(pubkey.get());
+        if (typeName)
+            info.publicKeyAlgorithm = typeName;
+
+        info.publicKeyBits = EVP_PKEY_bits(pubkey.get());
+        info.showPublicKeyBits = (EVP_PKEY_get_base_id(pubkey.get()) != EVP_PKEY_ED25519);
+    }
+
+    const char *sigAlg = OBJ_nid2sn(X509_get_signature_nid(cert.get()));
+    if (sigAlg)
+        info.signatureAlgorithm = sigAlg;
+
+    return info;
 }

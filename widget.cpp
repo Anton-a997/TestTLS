@@ -11,7 +11,7 @@ Widget::Widget(QWidget *parent) :
 
     QDir().mkpath("cert");
 
-    init_openssl();
+    TlsContext::initializeOpenSsl();
 }
 
 Widget::~Widget()
@@ -21,14 +21,6 @@ Widget::~Widget()
         tcp_server->close();
         delete tcp_server;
     }
-
-    if (ssl_server_ctx)
-        SSL_CTX_free(ssl_server_ctx);
-
-    if (ssl_client_ctx)
-        SSL_CTX_free(ssl_client_ctx);
-
-    cleanup_openssl();
 
     delete ui;
 }
@@ -44,7 +36,7 @@ void Widget::slotClientConnected()
     qint32 ip = tcp_socket->peerAddress().toIPv4Address();
     unsigned char *c_ip = (unsigned char*)&ip;
     ui->label->setText(QString("Входящее соединение от клиента ") + QString::number(c_ip[3]) + "." + QString::number(c_ip[2]) + "." + QString::number(c_ip[1]) + "." + QString::number(c_ip[0]));
-    ChatDialog *chat_dialog = new ChatDialog(tcp_socket, true, ssl_server_ctx);
+    ChatDialog *chat_dialog = new ChatDialog(tcp_socket, true, *ssl_server_ctx);
     chat_dialog->setAttribute(Qt::WA_DeleteOnClose);
     chat_dialog->show();
 }
@@ -62,7 +54,7 @@ bool Widget::StartServer()
         alg_string = "TLS_AES_128_GCM_SHA256";
 
     // создания контекста SSL для сервера
-    ssl_server_ctx = create_server_context(alg_string);
+    ssl_server_ctx = TlsContext::createServerContext(alg_string);
 
     if (!ssl_server_ctx)
     {
@@ -71,11 +63,9 @@ bool Widget::StartServer()
     }
 
     // загрузка сертификатов сервера
-    if (!load_server_cert(ssl_server_ctx, "cert\\server-cert.pem", "cert\\server-key.pem"))
+    if (!ssl_server_ctx->loadCertificateAndKey("cert/server-cert.pem", "cert/server-key.pem"))
     {
-        SSL_CTX_free(ssl_server_ctx);
-        ssl_server_ctx = nullptr;
-
+        ssl_server_ctx.reset();
         ui->label->setText("Не удалось загрузить сертификат и ключ сервера!");
         return false;
     }
@@ -86,8 +76,7 @@ bool Widget::StartServer()
 
     if (!tcp_server->listen(QHostAddress::Any, 13337))
     {
-        SSL_CTX_free(ssl_server_ctx);
-        ssl_server_ctx = nullptr;
+        ssl_server_ctx.reset();
 
         ui->label->setText(QObject::tr("Не удалось запустить сервер: %1.").arg(tcp_server->errorString()));
         delete tcp_server;
@@ -118,12 +107,7 @@ void Widget::ConnectToIP()
     else
     {
         ui->lineEdit->clear();
-        if (ssl_client_ctx)
-        {
-            SSL_CTX_free(ssl_client_ctx);
-            ssl_client_ctx = nullptr;
-        }
-        ssl_client_ctx = create_client_context(true);
+        ssl_client_ctx = TlsContext::createClientContext(true);
 
         if (!ssl_client_ctx)
         {
@@ -133,7 +117,7 @@ void Widget::ConnectToIP()
             return;
         }
 
-        ChatDialog *chat_dialog = new ChatDialog(tcp_socket, false, ssl_client_ctx);
+        ChatDialog *chat_dialog = new ChatDialog(tcp_socket, false, *ssl_client_ctx);
         chat_dialog->setAttribute(Qt::WA_DeleteOnClose);
         chat_dialog->show();
     }
@@ -148,38 +132,28 @@ void Widget::on_pushButton_2_clicked()
 void Widget::on_pushButton_3_clicked()
 {
     // генерация сертификатов
-    X509_REQ* req = NULL;
-    bool ok = false;
+    CertAlgorithm alg = CertAlgorithm::Rsa;
 
     if (ui->radioButton_5->isChecked())
-    {
-        if (create_ca_cert(CERT_RSA, "cert\\ca-cert.pem", "cert\\ca-key.pem")) // если успешно создан сертификат ЦС
-            if ((req = create_server_req(CERT_RSA, "cert\\server-req.pem", "cert\\server-key.pem")) != NULL) // и если успешно создан сертификат запроса REQ
-                if (create_server_cert(req, CERT_RSA, "cert\\ca-cert.pem", "cert\\ca-key.pem", "cert\\server-cert.pem")) // то создаем сам сертификат сервера
-                    ok = true;
-    }
-    else if (ui->radioButton_4->isChecked()) // далее аналогично для других алгоритмов
-    {
-        if (create_ca_cert(CERT_ECDSA, "cert\\ca-cert.pem", "cert\\ca-key.pem"))
-            if ((req = create_server_req(CERT_ECDSA, "cert\\server-req.pem", "cert\\server-key.pem")) != NULL)
-                if (create_server_cert(req, CERT_ECDSA, "cert\\ca-cert.pem", "cert\\ca-key.pem", "cert\\server-cert.pem"))
-                    ok = true;
-    }
+        alg = CertAlgorithm::Rsa;
+    else if (ui->radioButton_4->isChecked())
+        alg = CertAlgorithm::Ecdsa;
     else if (ui->radioButton_6->isChecked())
-    {
-        if (create_ca_cert(CERT_ED25519, "cert\\ca-cert.pem", "cert\\ca-key.pem"))
-            if ((req = create_server_req(CERT_ED25519, "cert\\server-req.pem", "cert\\server-key.pem")) != NULL)
-                if (create_server_cert(req, CERT_ED25519, "cert\\ca-cert.pem", "cert\\ca-key.pem", "cert\\server-cert.pem"))
-                    ok = true;
-    }
+        alg = CertAlgorithm::Ed25519;
+
+    bool ok = CertificateGenerator::generateServerCertificateChain(
+        alg,
+        "cert/ca-cert.pem",
+        "cert/ca-key.pem",
+        "cert/server-req.pem",
+        "cert/server-key.pem",
+        "cert/server-cert.pem"
+    );
 
     if (ok)
         ui->label->setText("Сертификат успешно создан");
     else
         ui->label->setText("Не удалось создать сертификат сервера!");
-
-    if (req)
-        X509_REQ_free(req);
 }
 
 void Widget::on_pushButton_4_clicked()
@@ -197,4 +171,3 @@ void Widget::slotBenchClosed()
     delete bench_dialog;
     bench_dialog = nullptr;
 }
-
