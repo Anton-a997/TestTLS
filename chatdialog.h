@@ -43,13 +43,17 @@ private:
     QString peer_ip;
 
     SSL *ssl = 0; // объект SSL - используется в течение одной TLS сессии
-    BIO *internal_bio, *network_bio; // буферы для чтения и записи TLS сообщений
+    BIO *internal_bio = 0, *network_bio = 0; // буферы для чтения и записи TLS сообщений
 
     bool is_server;
     bool tls_connect = false;
     bool tls_print_cert = false;
 
     int pub_alg = 0;
+    QByteArray recv_buffer;
+
+    void flushNetworkBio();
+    void printPeerCertificate();
 
 public slots:
     void slotSendMessage();

@@ -34,13 +34,10 @@ ChatDialog::ChatDialog(QTcpSocket *tcp_socket, bool is_server, SSL_CTX *ssl_ctx,
     // для клиента
     if (!is_server)
     {
-        char buf[4096];
-        int status = 0;
-        status = SSL_connect(ssl); // клиент инициирует подключение к серверу
+        int status = SSL_connect(ssl); // клиент инициирует подключение к серверу
 
         // чтение данных клиента TLS из BIO и отправка их через обычный TCP сокет
-        int bread = BIO_read(network_bio, buf, sizeof(buf));
-        tcp_socket->write(buf, bread);
+        flushNetworkBio();
 
         // проверка статуса операции
         if (status <= 0)
@@ -48,13 +45,14 @@ ChatDialog::ChatDialog(QTcpSocket *tcp_socket, bool is_server, SSL_CTX *ssl_ctx,
             int err = SSL_get_error(ssl, status);
 
             // эта ошибка значит, что клиенту требуются данные от сервера - установка соединения продолжается
-            if (err != SSL_ERROR_WANT_READ)
+            if (err != SSL_ERROR_WANT_READ && err != SSL_ERROR_WANT_WRITE)
                 // другая ошибка критична
                 ui->plainTextEdit->appendPlainText("Не удалось установить соединение с сервером: код ошибки " + QString::number(err) +"!\n\n");
         }
         else
         {
             tls_connect = true;
+            printPeerCertificate();
         }
     }
 }
@@ -74,10 +72,85 @@ ChatDialog::~ChatDialog()
         SSL_shutdown(ssl);
         SSL_free(ssl);
     }
+
+    if (network_bio)
+        BIO_free(network_bio);
+}
+
+void ChatDialog::flushNetworkBio()
+{
+    if (!network_bio || !tcp_socket)
+        return;
+
+    char buf[4096];
+    int bread = 0;
+
+    while ((bread = BIO_read(network_bio, buf, sizeof(buf))) > 0)
+    {
+        tcp_socket->write(buf, bread);
+    }
+}
+
+void ChatDialog::printPeerCertificate()
+{
+    if (tls_print_cert || is_server || !ssl)
+        return;
+
+    X509 *cert = SSL_get1_peer_certificate(ssl);
+
+    if (cert != nullptr)
+    {
+        ui->plainTextEdit->appendPlainText("Сертификат сервера:");
+
+        char *line = X509_NAME_oneline(X509_get_subject_name(cert), 0, 0);
+        if (line)
+        {
+            ui->plainTextEdit->appendPlainText(QString("Кому выдан: ") + QString(line));
+            OPENSSL_free(line);
+        }
+
+        line = X509_NAME_oneline(X509_get_issuer_name(cert), 0, 0);
+        if (line)
+        {
+            ui->plainTextEdit->appendPlainText(QString("Кем выдан: ") + QString(line));
+            OPENSSL_free(line);
+        }
+
+        ui->plainTextEdit->appendPlainText(QString("Версия: V") + QString::number(X509_get_version(cert) + 1));
+
+        EVP_PKEY* pubkey = X509_get_pubkey(cert);
+        if (pubkey)
+        {
+            const char *type_name = EVP_PKEY_get_type_name(pubkey);
+            QString pubkey_alg = QString("Алгоритм открытого ключа: ") + QString(type_name ? type_name : "");
+
+            if (EVP_PKEY_get_base_id(pubkey) != EVP_PKEY_ED25519)
+                pubkey_alg += QString(" (") + QString::number(EVP_PKEY_bits(pubkey)) + QString(" бит)");
+
+            ui->plainTextEdit->appendPlainText(pubkey_alg);
+            EVP_PKEY_free(pubkey);
+        }
+
+        ui->plainTextEdit->appendPlainText(QString("Алгоритм подписи: ") + QString(OBJ_nid2sn(X509_get_signature_nid(cert))) + QString("\n"));
+
+        X509_free(cert);
+    }
+    else
+    {
+        ui->plainTextEdit->appendPlainText("Не удалось получить сертификат сервера!\n\n");
+    }
+
+    tls_print_cert = true;
 }
 
 void ChatDialog::slotSendMessage()
 {
+    if (!tls_connect)
+    {
+        ui->plainTextEdit->appendPlainText("Соединение TLS еще не установлено!\n\n");
+        return;
+    }
+
     // открытое сообщение сохраняется в массив байт
     QString message = ui->plainTextEdit_2->toPlainText();
     QByteArray msg_bytes(message.toUtf8());
@@ -91,12 +164,13 @@ void ChatDialog::slotSendMessage()
     hdr.message_len = msg_bytes.length();
 
     // копирование заголовка и сообщения в буфер
-    char buf[8192];
-    memcpy(buf, &hdr, sizeof(MESSAGE_HEADER));
-    memcpy(buf + sizeof(MESSAGE_HEADER), msg_bytes.data(), msg_bytes.length());
+    QByteArray packet;
+    packet.resize(static_cast<int>(sizeof(MESSAGE_HEADER)) + msg_bytes.length());
+    memcpy(packet.data(), &hdr, sizeof(MESSAGE_HEADER));
+    memcpy(packet.data() + sizeof(MESSAGE_HEADER), msg_bytes.constData(), msg_bytes.length());
 
     // отправка подготовленных данных через TLS - они попадают в буфер BIO
-    int tls_send = tls_send_packet(ssl, buf, static_cast<int>(sizeof(MESSAGE_HEADER) + msg_bytes.length()));
+    int tls_send = tls_send_packet(ssl, packet.constData(), packet.size());
 
     // ошибка
     if (tls_send <= 0)
@@ -106,32 +180,29 @@ void ChatDialog::slotSendMessage()
     }
 
     // из BIO данные берутся в зашифрованном виде и отправляются через TCP сокет
-    int bread = BIO_read(network_bio, buf, sizeof(buf));
-    tcp_socket->write(buf, bread);
+    flushNetworkBio();
 }
 
 void ChatDialog::slotReadSocket()
 {
-    char buf[16384];
-
     // на TCP сокет пришел зашифрованный пакет
-    int brecv = tcp_socket->read(buf, 16384);
+    QByteArray incoming = tcp_socket->readAll();
+    if (incoming.isEmpty())
+        return;
+
     // получаем его и отправляем в буфер BIO
-    BIO_write(network_bio, buf, brecv);
+    BIO_write(network_bio, incoming.constData(), incoming.size());
 
     // если мы на этапе хендшейка
     if (!tls_connect)
     {
-        int bread = 0;
-
         // для сервера
         if (is_server)
         {
-            int status = 0;
-            status = SSL_accept(ssl); // сервер получил пакет от клиента и продолжает хендшейк
+            int status = SSL_accept(ssl); // сервер получил пакет от клиента и продолжает хендшейк
 
-            // чтение данных от сервера TLS из BIO
-            bread = BIO_read(network_bio, buf, sizeof(buf));
+            // отправка данных от сервера TLS из BIO через TCP сокет
+            flushNetworkBio();
 
             // проверка статуса операции
             if (status <= 0)
@@ -139,9 +210,10 @@ void ChatDialog::slotReadSocket()
                 int err = SSL_get_error(ssl, status);
 
                 // эта ошибка значит, что серверу требуются данные от клиента - установка соединения продолжается
-                if (err != SSL_ERROR_WANT_READ)
+                if (err != SSL_ERROR_WANT_READ && err != SSL_ERROR_WANT_WRITE)
                     // другая ошибка критична
-                    ui->plainTextEdit->appendPlainText("Не удалось установить соединение с сервером: код ошибки " + QString::number(err) +"!\n\n");
+                    ui->plainTextEdit->appendPlainText("Не удалось установить соединение с клиентом: код ошибки " + QString::number(err) +"!\n\n");
+                return;
             }
             else
             {
@@ -150,15 +222,13 @@ void ChatDialog::slotReadSocket()
                 ui->plainTextEdit->appendPlainText("Установлено TLS соединение с клиентом!\n");
             }
         }
-
-        // для клиента
-        if (!is_server)
+        else
         {
-            int status = 0;
-            status = SSL_connect(ssl); // клиент получил пакет от сервера и продолжает хендшейк
+            // для клиента
+            int status = SSL_connect(ssl); // клиент получил пакет от сервера и продолжает хендшейк
 
-            // чтение данных от клиента TLS из BIO
-            bread = BIO_read(network_bio, buf, sizeof(buf));
+            // отправка ответа клиента из BIO через TCP сокет
+            flushNetworkBio();
 
             // проверка статуса операции
             if (status <= 0)
@@ -166,117 +236,68 @@ void ChatDialog::slotReadSocket()
                 int err = SSL_get_error(ssl, status);
 
                 // эта ошибка значит, что клиенту требуются данные от сервера - установка соединения продолжается
-                if (err != SSL_ERROR_WANT_READ)
+                if (err != SSL_ERROR_WANT_READ && err != SSL_ERROR_WANT_WRITE)
                     // другая ошибка критична
                     ui->plainTextEdit->appendPlainText("Не удалось установить соединение с сервером: код ошибки " + QString::number(err) +"!\n\n");
+                return;
             }
             else
             {
                 // status == 1 - хендшейк установлен
                 tls_connect = true;
                 ui->plainTextEdit->appendPlainText("Установлено TLS соединение с сервером!\n");
+                printPeerCertificate();
             }
         }
-
-        // отправка ответа клиента через TCP сокет
-        tcp_socket->write(buf, bread);
-
-        return;
     }
 
     // если мы на этапе обмена сообщениями, получаем расшифрованный пакет TLS из BIO
+    char buf[16384];
     int tls_recv = tls_recv_packet(ssl, buf, sizeof(buf));
+    flushNetworkBio();
 
-    // пустой пакет
+    // пустой пакет (например, обработан пост-хендшейк пакет NewSessionTicket)
     if (tls_recv == 0)
         return;
 
-    // первый пакет от сервера после хендшейка
     if (tls_recv < 0)
     {
-        // клиент выводит сертификат
-        if (!tls_print_cert && !is_server)
+        ui->plainTextEdit->appendPlainText("Ошибка при получении TLS сообщения: код ошибки " + QString::number(-tls_recv) + "!\n\n");
+        return;
+    }
+
+    // накопление полученных байт открытого сообщения и разбор кадров
+    recv_buffer.append(buf, tls_recv);
+
+    while (recv_buffer.size() >= static_cast<int>(sizeof(MESSAGE_HEADER)))
+    {
+        MESSAGE_HEADER hdr;
+        memcpy(&hdr, recv_buffer.constData(), sizeof(MESSAGE_HEADER));
+
+        if (hdr.message_len < 0)
         {
-            X509 *cert = SSL_get_peer_certificate(ssl);
-
-            if (cert != nullptr)
-            {
-                ui->plainTextEdit->appendPlainText("Сертификат сервера:");
-
-                char *line = X509_NAME_oneline(X509_get_subject_name(cert), 0, 0);
-                ui->plainTextEdit->appendPlainText(QString("Кому выдан: ") + QString(line));
-                delete line;
-
-                line = X509_NAME_oneline(X509_get_issuer_name(cert), 0, 0);
-                ui->plainTextEdit->appendPlainText(QString("Кем видан: ") + QString(line));
-                delete line;
-
-                ui->plainTextEdit->appendPlainText(QString("Версия: V") + QString::number(X509_get_version(cert) + 1));
-
-                EVP_PKEY* pubkey = X509_get_pubkey(cert);
-                QString pubkey_alg = QString("Алгоритм открытого ключа: ") + QString(EVP_PKEY_get_type_name(pubkey));
-
-                if (EVP_PKEY_get_type_name(pubkey)[0] != '1')
-                    pubkey_alg += QString(" (") + QString::number(EVP_PKEY_bits(pubkey)) + QString(" бит)");
-
-                ui->plainTextEdit->appendPlainText(pubkey_alg);
-                ui->plainTextEdit->appendPlainText(QString("Алгоритм подписи: ") + QString(OBJ_nid2sn(X509_get_signature_nid(cert))) + QString("\n"));
-
-                EVP_PKEY_free(pubkey);
-                X509_free(cert);
-            }
-            else
-            {
-                ui->plainTextEdit->appendPlainText("Не удалось получить сертификат сервера!\n\n");
-            }
-
-            tls_print_cert = true;
+            recv_buffer.clear();
+            break;
         }
-        else
-            ui->plainTextEdit->appendPlainText("Ошибка при получении TLS сообщения: код ошибки " + QString::number(-tls_recv) + "!\n\n");
 
-        return;
-    }
+        int frame_size = static_cast<int>(sizeof(MESSAGE_HEADER)) + hdr.message_len;
+        if (recv_buffer.size() < frame_size)
+            break;
 
-    // обмен сообщениями
-    char* rd_buf = buf;
+        QByteArray payload = recv_buffer.mid(sizeof(MESSAGE_HEADER), hdr.message_len);
+        recv_buffer.remove(0, frame_size);
 
-    static QByteArray data; // массив полученных байт открытого сообщения
-    static MESSAGE_HEADER hdr; // заголовок открытого сообщения
-    static int data_read; // сколько получено байт
-
-    hdr = *(MESSAGE_HEADER*)rd_buf; // чтение заголовка сообщения
-    rd_buf += sizeof(MESSAGE_HEADER);
-
-    data_read = 0;
-    data.clear();
-
-    // если получено меньше, чем указано в заголовке сообщения
-    if (data_read < hdr.message_len)
-    {
-        // запоминием полученную часть
-        QByteArray part = QByteArray(rd_buf, hdr.message_len - data_read);
-        data_read += part.length();
-        data += part;
-    }
-
-    // если получено меньше, чем указано в заголовке сообщения, выходим из функции - потом получим ещё
-    if (data_read < hdr.message_len)
-        return;
-
-    // если сообщение готово
-    QString message;
-
-    // Выводим в виджет
-    switch (hdr.message_type)
-    {
-    case MESSAGE_TEXT:
-        message = QString(data);
-        ui->plainTextEdit->appendPlainText(peer_ip + ": " + message + "\n");
-        break;
-
-    default:
-        break;
+        switch (hdr.message_type)
+        {
+        case MESSAGE_TEXT:
+        {
+            QString message = QString::fromUtf8(payload);
+            ui->plainTextEdit->appendPlainText(peer_ip + ": " + message + "\n");
+            break;
+        }
+        default:
+            break;
+        }
     }
 }
 
@@ -291,7 +312,7 @@ bool KeyPressEater::eventFilter(QObject *obj, QEvent *event)
     {
         QKeyEvent *keyEvent = static_cast<QKeyEvent *>(event);
 
-        if (keyEvent->key() == Qt::Key_Return || keyEvent->key() == Qt::Key_Return + 1)
+        if (keyEvent->key() == Qt::Key_Return || keyEvent->key() == Qt::Key_Enter)
         {
             emit signalSendMessage();
             return true;
