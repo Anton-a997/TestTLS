@@ -26,29 +26,21 @@ public:
 
 private slots:
     void on_pushButton_clicked();
-
     void slotClientConnected();
-
     void on_pushButton_2_clicked();
-
     void on_pushButton_3_clicked();
-
     void on_pushButton_4_clicked();
-
     void slotBenchClosed();
 
 private:
+    bool startServer();
+    void connectToIp();
+
     Ui::Widget *ui;
-
-    Benchmark *bench_dialog = nullptr;
-
-    QTcpServer *tcp_server = nullptr;
-
-    std::unique_ptr<TlsContext> ssl_server_ctx;
-    std::unique_ptr<TlsContext> ssl_client_ctx;
-
-    bool StartServer(); // запуск сервера
-    void ConnectToIP(); // подключение клиента
+    Benchmark *m_benchDialog = nullptr;
+    QTcpServer *m_tcpServer = nullptr;
+    std::unique_ptr<TlsContext> m_sslServerCtx;
+    std::unique_ptr<TlsContext> m_sslClientCtx;
 };
 
 #endif // WIDGET_H

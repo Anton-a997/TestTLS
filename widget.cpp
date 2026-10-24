@@ -2,10 +2,15 @@
 #include "ui_widget.h"
 
 #include <QDir>
+#include <QHostAddress>
 
-Widget::Widget(QWidget *parent) :
-    QWidget(parent),
-    ui(new Ui::Widget)
+namespace {
+constexpr quint16 kDefaultTlsPort = 13337;
+} // namespace
+
+Widget::Widget(QWidget *parent)
+    : QWidget(parent)
+    , ui(new Ui::Widget)
 {
     ui->setupUi(this);
 
@@ -16,10 +21,10 @@ Widget::Widget(QWidget *parent) :
 
 Widget::~Widget()
 {
-    if (tcp_server)
+    if (m_tcpServer)
     {
-        tcp_server->close();
-        delete tcp_server;
+        m_tcpServer->close();
+        delete m_tcpServer;
     }
 
     delete ui;
@@ -27,105 +32,100 @@ Widget::~Widget()
 
 void Widget::on_pushButton_clicked()
 {
-    ConnectToIP();
+    connectToIp();
 }
 
 void Widget::slotClientConnected()
 {
-    QTcpSocket *tcp_socket = tcp_server->nextPendingConnection();
-    qint32 ip = tcp_socket->peerAddress().toIPv4Address();
-    unsigned char *c_ip = (unsigned char*)&ip;
-    ui->label->setText(QString("Входящее соединение от клиента ") + QString::number(c_ip[3]) + "." + QString::number(c_ip[2]) + "." + QString::number(c_ip[1]) + "." + QString::number(c_ip[0]));
-    ChatDialog *chat_dialog = new ChatDialog(tcp_socket, true, *ssl_server_ctx);
-    chat_dialog->setAttribute(Qt::WA_DeleteOnClose);
-    chat_dialog->show();
+    QTcpSocket *tcpSocket = m_tcpServer->nextPendingConnection();
+    const QString peerIp = QHostAddress(tcpSocket->peerAddress().toIPv4Address()).toString();
+    ui->label->setText(QString("Входящее соединение от клиента ") + peerIp);
+
+    ChatDialog *chatDialog = new ChatDialog(tcpSocket, true, *m_sslServerCtx);
+    chatDialog->setAttribute(Qt::WA_DeleteOnClose);
+    chatDialog->show();
 }
 
-bool Widget::StartServer()
+bool Widget::startServer()
 {
-    const char *alg_string = "";
+    const char *algString = "";
 
     // выбор алгоритма шифрования на сессию
     if (ui->radioButton->isChecked())
-        alg_string = "TLS_AES_256_GCM_SHA384";
+        algString = "TLS_AES_256_GCM_SHA384";
     else if (ui->radioButton_2->isChecked())
-        alg_string = "TLS_CHACHA20_POLY1305_SHA256";
+        algString = "TLS_CHACHA20_POLY1305_SHA256";
     else if (ui->radioButton_3->isChecked())
-        alg_string = "TLS_AES_128_GCM_SHA256";
+        algString = "TLS_AES_128_GCM_SHA256";
 
-    // создания контекста SSL для сервера
-    ssl_server_ctx = TlsContext::createServerContext(alg_string);
-
-    if (!ssl_server_ctx)
+    // создание контекста SSL для сервера
+    m_sslServerCtx = TlsContext::createServerContext(algString);
+    if (!m_sslServerCtx)
     {
         ui->label->setText("Не удалось создать контекст SSL");
         return false;
     }
 
     // загрузка сертификатов сервера
-    if (!ssl_server_ctx->loadCertificateAndKey("cert/server-cert.pem", "cert/server-key.pem"))
+    if (!m_sslServerCtx->loadCertificateAndKey("cert/server-cert.pem", "cert/server-key.pem"))
     {
-        ssl_server_ctx.reset();
+        m_sslServerCtx.reset();
         ui->label->setText("Не удалось загрузить сертификат и ключ сервера!");
         return false;
     }
 
     // запуск сервера
-    tcp_server = new QTcpServer(this);
-    connect(tcp_server, SIGNAL(newConnection()), this, SLOT(slotClientConnected()));
+    m_tcpServer = new QTcpServer(this);
+    connect(m_tcpServer, &QTcpServer::newConnection, this, &Widget::slotClientConnected);
 
-    if (!tcp_server->listen(QHostAddress::Any, 13337))
+    if (!m_tcpServer->listen(QHostAddress::Any, kDefaultTlsPort))
     {
-        ssl_server_ctx.reset();
+        m_sslServerCtx.reset();
 
-        ui->label->setText(QObject::tr("Не удалось запустить сервер: %1.").arg(tcp_server->errorString()));
-        delete tcp_server;
-        tcp_server = nullptr;
+        ui->label->setText(QObject::tr("Не удалось запустить сервер: %1.").arg(m_tcpServer->errorString()));
+        delete m_tcpServer;
+        m_tcpServer = nullptr;
         return false;
     }
-    else
-    {
-        ui->label->setText("Ожидание подключения клиента...");
-    }
 
+    ui->label->setText("Ожидание подключения клиента...");
     return true;
 }
 
-void Widget::ConnectToIP()
+void Widget::connectToIp()
 {
-    QString str_ip = ui->lineEdit->text();
-    str_ip.remove(' ');
+    QString strIp = ui->lineEdit->text();
+    strIp.remove(' ');
 
-    QTcpSocket *tcp_socket = new QTcpSocket();
-    tcp_socket->connectToHost(str_ip, 13337);
+    QTcpSocket *tcpSocket = new QTcpSocket();
+    tcpSocket->connectToHost(strIp, kDefaultTlsPort);
 
-    if (!tcp_socket->waitForConnected())
+    if (!tcpSocket->waitForConnected())
     {
-        delete tcp_socket;
+        delete tcpSocket;
         QMessageBox::critical(this, "Ошибка", "Не удалось установить соединение с сервером!");
+        return;
     }
-    else
+
+    ui->lineEdit->clear();
+    m_sslClientCtx = TlsContext::createClientContext(true);
+
+    if (!m_sslClientCtx)
     {
-        ui->lineEdit->clear();
-        ssl_client_ctx = TlsContext::createClientContext(true);
-
-        if (!ssl_client_ctx)
-        {
-            tcp_socket->close();
-            delete tcp_socket;
-            QMessageBox::critical(this, "Ошибка", "Не удалось создать контекст SSL!");
-            return;
-        }
-
-        ChatDialog *chat_dialog = new ChatDialog(tcp_socket, false, *ssl_client_ctx);
-        chat_dialog->setAttribute(Qt::WA_DeleteOnClose);
-        chat_dialog->show();
+        tcpSocket->close();
+        delete tcpSocket;
+        QMessageBox::critical(this, "Ошибка", "Не удалось создать контекст SSL!");
+        return;
     }
+
+    ChatDialog *chatDialog = new ChatDialog(tcpSocket, false, *m_sslClientCtx);
+    chatDialog->setAttribute(Qt::WA_DeleteOnClose);
+    chatDialog->show();
 }
 
 void Widget::on_pushButton_2_clicked()
 {
-    if (StartServer())
+    if (startServer())
         ui->pushButton_2->setEnabled(false);
 }
 
@@ -141,7 +141,7 @@ void Widget::on_pushButton_3_clicked()
     else if (ui->radioButton_6->isChecked())
         alg = CertAlgorithm::Ed25519;
 
-    bool ok = CertificateGenerator::generateServerCertificateChain(
+    const bool ok = CertificateGenerator::generateServerCertificateChain(
         alg,
         "cert/ca-cert.pem",
         "cert/ca-key.pem",
@@ -158,16 +158,16 @@ void Widget::on_pushButton_3_clicked()
 
 void Widget::on_pushButton_4_clicked()
 {
-    if (bench_dialog)
+    if (m_benchDialog)
         return;
 
-    bench_dialog = new Benchmark();
-    QObject::connect(bench_dialog, SIGNAL(Closed()), this, SLOT(slotBenchClosed()));
-    bench_dialog->show();
+    m_benchDialog = new Benchmark();
+    connect(m_benchDialog, &Benchmark::Closed, this, &Widget::slotBenchClosed);
+    m_benchDialog->show();
 }
 
 void Widget::slotBenchClosed()
 {
-    delete bench_dialog;
-    bench_dialog = nullptr;
+    delete m_benchDialog;
+    m_benchDialog = nullptr;
 }

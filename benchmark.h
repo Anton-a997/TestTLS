@@ -72,19 +72,6 @@ public:
 protected:
     void closeEvent(QCloseEvent *event) override;
 
-private:
-    Ui::Benchmark *ui;
-    QThread *m_workerThread = nullptr;
-
-    void ResetTable();
-    void StartBench();
-    void stopWorkerThread();
-    void setControlsEnabled(bool enabled);
-
-    long CERT_SIGN_ATTEMPTS = 1000;
-    long HANDSHAKE_ATTEMPTS = 1000;
-    long MESSAGES_TO_SEND = 100000;
-
 signals:
     void Closed();
 
@@ -97,6 +84,18 @@ private slots:
     void onBenchmarkProgress(int percent);
     void onBenchmarkFinished(const BenchmarkResult &result);
     void onBenchmarkError(const QString &message);
+
+private:
+    void resetTable();
+    void startBench();
+    void stopWorkerThread();
+    void setControlsEnabled(bool enabled);
+
+    Ui::Benchmark *ui;
+    QThread *m_workerThread = nullptr;
+    long m_certSignAttempts = 1000;
+    long m_handshakeAttempts = 1000;
+    long m_messagesToSend = 100000;
 };
 
 #endif // BENCHMARK_H

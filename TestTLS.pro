@@ -10,6 +10,7 @@ greaterThan(QT_MAJOR_VERSION, 4): QT += widgets
 
 TARGET = TestTLS
 TEMPLATE = app
+CONFIG += c++17
 
 # The following define makes your compiler emit warnings if you use
 # any feature of Qt which has been marked as deprecated (the exact warnings
@@ -26,19 +27,19 @@ DEFINES += QT_DEPRECATED_WARNINGS
 SOURCES += \
     benchmark.cpp \
     crypto.cpp \
-        main.cpp \
-        widget.cpp \
+    main.cpp \
+    widget.cpp \
     chatdialog.cpp
 
 HEADERS += \
     benchmark.h \
     crypto.h \
-        widget.h \
+    widget.h \
     chatdialog.h
 
 FORMS += \
     benchmark.ui \
-        widget.ui \
+    widget.ui \
     chatdialog.ui
 
 INCLUDEPATH += "C:/Program Files/OpenSSL-Win64/include"

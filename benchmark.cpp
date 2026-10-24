@@ -305,14 +305,14 @@ void BenchmarkWorker::process()
 // Benchmark
 // ============================================================================
 
-Benchmark::Benchmark(QWidget *parent) :
-    QWidget(parent),
-    ui(new Ui::Benchmark)
+Benchmark::Benchmark(QWidget *parent)
+    : QWidget(parent)
+    , ui(new Ui::Benchmark)
 {
     qRegisterMetaType<BenchmarkResult>("BenchmarkResult");
     ui->setupUi(this);
 
-    ResetTable();
+    resetTable();
 }
 
 Benchmark::~Benchmark()
@@ -349,7 +349,7 @@ void Benchmark::setControlsEnabled(bool enabled)
     ui->groupBox->setEnabled(enabled);
 }
 
-void Benchmark::ResetTable()
+void Benchmark::resetTable()
 {
     for (int i = 0; i < ui->tableWidget->rowCount(); i++)
     {
@@ -359,14 +359,14 @@ void Benchmark::ResetTable()
         }
     }
 
-    ui->spinBox->setValue(CERT_SIGN_ATTEMPTS);
-    ui->spinBox_2->setValue(HANDSHAKE_ATTEMPTS);
-    ui->spinBox_3->setValue(MESSAGES_TO_SEND);
+    ui->spinBox->setValue(m_certSignAttempts);
+    ui->spinBox_2->setValue(m_handshakeAttempts);
+    ui->spinBox_3->setValue(m_messagesToSend);
     ui->lineEdit_4->setText("0");
     ui->progressBar->setValue(0);
 }
 
-void Benchmark::StartBench()
+void Benchmark::startBench()
 {
     stopWorkerThread();
 
@@ -385,9 +385,9 @@ void Benchmark::StartBench()
     else if (ui->radioButton_6->isChecked())
         config.certAlgorithm = CertAlgorithm::Ed25519;
 
-    config.certSignAttempts = CERT_SIGN_ATTEMPTS;
-    config.handshakeAttempts = HANDSHAKE_ATTEMPTS;
-    config.messagesToSend = MESSAGES_TO_SEND;
+    config.certSignAttempts = m_certSignAttempts;
+    config.handshakeAttempts = m_handshakeAttempts;
+    config.messagesToSend = m_messagesToSend;
 
     m_workerThread = new QThread(this);
     BenchmarkWorker *worker = new BenchmarkWorker(config);
@@ -438,21 +438,21 @@ void Benchmark::onBenchmarkError(const QString &message)
 
 void Benchmark::on_pushButton_clicked()
 {
-    ResetTable();
-    StartBench();
+    resetTable();
+    startBench();
 }
 
 void Benchmark::on_spinBox_valueChanged(int arg1)
 {
-    CERT_SIGN_ATTEMPTS = arg1;
+    m_certSignAttempts = arg1;
 }
 
 void Benchmark::on_spinBox_2_valueChanged(int arg1)
 {
-    HANDSHAKE_ATTEMPTS = arg1;
+    m_handshakeAttempts = arg1;
 }
 
 void Benchmark::on_spinBox_3_valueChanged(int arg1)
 {
-    MESSAGES_TO_SEND = arg1;
+    m_messagesToSend = arg1;
 }

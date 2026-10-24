@@ -1,34 +1,33 @@
 #include "chatdialog.h"
 #include "ui_chatdialog.h"
 
-#include <QKeyEvent>
 #include <cstring>
 
-ChatDialog::ChatDialog(QTcpSocket *tcp_socket, bool is_server, const TlsContext &ssl_ctx, QWidget *parent) :
-    QWidget(parent),
-    ui(new Ui::ChatDialog),
-    tls_session(std::make_unique<TlsSession>(ssl_ctx, is_server)),
-    is_server(is_server)
+#include <QHostAddress>
+#include <QKeyEvent>
+
+ChatDialog::ChatDialog(QTcpSocket *tcpSocket, bool isServer, const TlsContext &sslCtx, QWidget *parent)
+    : QWidget(parent)
+    , ui(new Ui::ChatDialog)
+    , m_tcpSocket(tcpSocket)
+    , m_tlsSession(std::make_unique<TlsSession>(sslCtx, isServer))
+    , m_isServer(isServer)
 {
     ui->setupUi(this);
 
-    // настройка виджета
-    keyPressEater = new KeyPressEater(this);
-    connect(keyPressEater, SIGNAL(signalSendMessage()), this, SLOT(slotSendMessage()));
-    ui->plainTextEdit_2->installEventFilter(keyPressEater);
+    m_keyPressEater = new KeyPressEater(this);
+    connect(m_keyPressEater, &KeyPressEater::signalSendMessage, this, &ChatDialog::slotSendMessage);
+    ui->plainTextEdit_2->installEventFilter(m_keyPressEater);
 
-    this->tcp_socket = tcp_socket;
-    connect(tcp_socket, SIGNAL(readyRead()), this, SLOT(slotReadSocket()));
-    qint32 ip = tcp_socket->peerAddress().toIPv4Address();
-    unsigned char *c_ip = (unsigned char*)&ip;
-    peer_ip = QString::number(c_ip[3]) + "." + QString::number(c_ip[2]) + "." + QString::number(c_ip[1]) + "." + QString::number(c_ip[0]);
-    setWindowTitle("Обмен сообщениями TLS 1.3 - " + peer_ip);
+    connect(m_tcpSocket, &QTcpSocket::readyRead, this, &ChatDialog::slotReadSocket);
+    m_peerIp = QHostAddress(m_tcpSocket->peerAddress().toIPv4Address()).toString();
+    setWindowTitle("Обмен сообщениями TLS 1.3 - " + m_peerIp);
 
     // для клиента
-    if (!is_server)
+    if (!m_isServer)
     {
         int err = 0;
-        HandshakeStatus status = tls_session->stepHandshake(&err);
+        const HandshakeStatus status = m_tlsSession->stepHandshake(&err);
         flushNetworkBio();
 
         if (status == HandshakeStatus::Failed)
@@ -46,31 +45,31 @@ ChatDialog::~ChatDialog()
 {
     delete ui;
 
-    if (keyPressEater)
-        delete keyPressEater;
+    if (m_keyPressEater)
+        delete m_keyPressEater;
 
-    if (tcp_socket)
-        tcp_socket->close();
+    if (m_tcpSocket)
+        m_tcpSocket->close();
 }
 
 void ChatDialog::flushNetworkBio()
 {
-    if (!tls_session || !tcp_socket)
+    if (!m_tlsSession || !m_tcpSocket)
         return;
 
-    std::vector<char> outgoing = tls_session->takeOutgoingData();
+    const std::vector<char> outgoing = m_tlsSession->takeOutgoingData();
     if (!outgoing.empty())
     {
-        tcp_socket->write(outgoing.data(), static_cast<qint64>(outgoing.size()));
+        m_tcpSocket->write(outgoing.data(), static_cast<qint64>(outgoing.size()));
     }
 }
 
 void ChatDialog::printPeerCertificate()
 {
-    if (tls_print_cert || is_server || !tls_session)
+    if (m_tlsPrintCert || m_isServer || !m_tlsSession)
         return;
 
-    PeerCertificateInfo info = tls_session->peerCertificateInfo();
+    const PeerCertificateInfo info = m_tlsSession->peerCertificateInfo();
     if (info.valid)
     {
         ui->plainTextEdit->appendPlainText("Сертификат сервера:");
@@ -78,11 +77,11 @@ void ChatDialog::printPeerCertificate()
         ui->plainTextEdit->appendPlainText(QString("Кем выдан: ") + QString::fromStdString(info.issuer));
         ui->plainTextEdit->appendPlainText(QString("Версия: V") + QString::number(info.version));
 
-        QString pubkey_alg = QString("Алгоритм открытого ключа: ") + QString::fromStdString(info.publicKeyAlgorithm);
+        QString pubkeyAlg = QString("Алгоритм открытого ключа: ") + QString::fromStdString(info.publicKeyAlgorithm);
         if (info.showPublicKeyBits)
-            pubkey_alg += QString(" (") + QString::number(info.publicKeyBits) + QString(" бит)");
+            pubkeyAlg += QString(" (") + QString::number(info.publicKeyBits) + QString(" бит)");
 
-        ui->plainTextEdit->appendPlainText(pubkey_alg);
+        ui->plainTextEdit->appendPlainText(pubkeyAlg);
         ui->plainTextEdit->appendPlainText(QString("Алгоритм подписи: ") + QString::fromStdString(info.signatureAlgorithm) + QString("\n"));
     }
     else
@@ -90,38 +89,34 @@ void ChatDialog::printPeerCertificate()
         ui->plainTextEdit->appendPlainText("Не удалось получить сертификат сервера!\n\n");
     }
 
-    tls_print_cert = true;
+    m_tlsPrintCert = true;
 }
 
 void ChatDialog::slotSendMessage()
 {
-    if (!tls_session || !tls_session->isHandshakeCompleted())
+    if (!m_tlsSession || !m_tlsSession->isHandshakeCompleted())
     {
         ui->plainTextEdit->appendPlainText("Соединение TLS еще не установлено!\n\n");
         return;
     }
 
-    // открытое сообщение сохраняется в массив байт
-    QString message = ui->plainTextEdit_2->toPlainText();
-    QByteArray msg_bytes(message.toUtf8());
+    const QString message = ui->plainTextEdit_2->toPlainText();
+    const QByteArray msgBytes(message.toUtf8());
 
     ui->plainTextEdit->appendPlainText("Я: " + message + "\n");
     ui->plainTextEdit_2->clear();
 
-    // заголовок открытого сообщения, чтоб знать длину
-    MESSAGE_HEADER hdr;
-    hdr.message_type = MESSAGE_TEXT;
-    hdr.message_len = msg_bytes.length();
+    MessageHeader hdr{};
+    hdr.messageType = static_cast<int16_t>(MessageType::Text);
+    hdr.messageLen = static_cast<int32_t>(msgBytes.length());
 
-    // копирование заголовка и сообщения в буфер
     QByteArray packet;
-    packet.resize(static_cast<int>(sizeof(MESSAGE_HEADER)) + msg_bytes.length());
-    std::memcpy(packet.data(), &hdr, sizeof(MESSAGE_HEADER));
-    std::memcpy(packet.data() + sizeof(MESSAGE_HEADER), msg_bytes.constData(), msg_bytes.length());
+    packet.resize(static_cast<int>(sizeof(MessageHeader)) + msgBytes.length());
+    std::memcpy(packet.data(), &hdr, sizeof(MessageHeader));
+    std::memcpy(packet.data() + sizeof(MessageHeader), msgBytes.constData(), msgBytes.length());
 
-    // отправка подготовленных данных через TLS
-    int tls_send = tls_session->sendApplicationData(packet.constData(), packet.size());
-    if (tls_send <= 0)
+    const int tlsSend = m_tlsSession->sendApplicationData(packet.constData(), packet.size());
+    if (tlsSend <= 0)
     {
         ui->plainTextEdit->appendPlainText("Ошибка при отправке TLS сообщения!\n\n");
         return;
@@ -132,31 +127,31 @@ void ChatDialog::slotSendMessage()
 
 void ChatDialog::slotReadSocket()
 {
-    if (!tls_session || !tcp_socket)
+    if (!m_tlsSession || !m_tcpSocket)
         return;
 
-    QByteArray incoming = tcp_socket->readAll();
+    const QByteArray incoming = m_tcpSocket->readAll();
     if (incoming.isEmpty())
         return;
 
-    tls_session->feedIncomingData(incoming.constData(), incoming.size());
+    m_tlsSession->feedIncomingData(incoming.constData(), incoming.size());
 
     // если мы на этапе хендшейка
-    if (!tls_session->isHandshakeCompleted())
+    if (!m_tlsSession->isHandshakeCompleted())
     {
         int err = 0;
-        HandshakeStatus status = tls_session->stepHandshake(&err);
+        const HandshakeStatus status = m_tlsSession->stepHandshake(&err);
         flushNetworkBio();
 
         if (status == HandshakeStatus::Failed)
         {
-            QString peer_role = is_server ? "клиентом" : "сервером";
-            ui->plainTextEdit->appendPlainText("Не удалось установить соединение с " + peer_role + ": код ошибки " + QString::number(err) + "!\n\n");
+            const QString peerRole = m_isServer ? "клиентом" : "сервером";
+            ui->plainTextEdit->appendPlainText("Не удалось установить соединение с " + peerRole + ": код ошибки " + QString::number(err) + "!\n\n");
             return;
         }
         else if (status == HandshakeStatus::Completed)
         {
-            if (is_server)
+            if (m_isServer)
             {
                 ui->plainTextEdit->appendPlainText("Установлено TLS соединение с клиентом!\n");
             }
@@ -174,44 +169,44 @@ void ChatDialog::slotReadSocket()
 
     // если мы на этапе обмена сообщениями, получаем расшифрованный пакет TLS
     char buf[16384];
-    int tls_recv = tls_session->receiveApplicationData(buf, sizeof(buf));
+    const int tlsRecv = m_tlsSession->receiveApplicationData(buf, sizeof(buf));
     flushNetworkBio();
 
-    if (tls_recv == 0)
+    if (tlsRecv == 0)
         return;
 
-    if (tls_recv < 0)
+    if (tlsRecv < 0)
     {
-        ui->plainTextEdit->appendPlainText("Ошибка при получении TLS сообщения: код ошибки " + QString::number(-tls_recv) + "!\n\n");
+        ui->plainTextEdit->appendPlainText("Ошибка при получении TLS сообщения: код ошибки " + QString::number(-tlsRecv) + "!\n\n");
         return;
     }
 
-    recv_buffer.append(buf, tls_recv);
+    m_recvBuffer.append(buf, tlsRecv);
 
-    while (recv_buffer.size() >= static_cast<int>(sizeof(MESSAGE_HEADER)))
+    while (m_recvBuffer.size() >= static_cast<int>(sizeof(MessageHeader)))
     {
-        MESSAGE_HEADER hdr;
-        std::memcpy(&hdr, recv_buffer.constData(), sizeof(MESSAGE_HEADER));
+        MessageHeader hdr{};
+        std::memcpy(&hdr, m_recvBuffer.constData(), sizeof(MessageHeader));
 
-        if (hdr.message_len < 0)
+        if (hdr.messageLen < 0)
         {
-            recv_buffer.clear();
+            m_recvBuffer.clear();
             break;
         }
 
-        int frame_size = static_cast<int>(sizeof(MESSAGE_HEADER)) + hdr.message_len;
-        if (recv_buffer.size() < frame_size)
+        const int frameSize = static_cast<int>(sizeof(MessageHeader)) + hdr.messageLen;
+        if (m_recvBuffer.size() < frameSize)
             break;
 
-        QByteArray payload = recv_buffer.mid(sizeof(MESSAGE_HEADER), hdr.message_len);
-        recv_buffer.remove(0, frame_size);
+        const QByteArray payload = m_recvBuffer.mid(sizeof(MessageHeader), hdr.messageLen);
+        m_recvBuffer.remove(0, frameSize);
 
-        switch (hdr.message_type)
+        switch (static_cast<MessageType>(hdr.messageType))
         {
-        case MESSAGE_TEXT:
+        case MessageType::Text:
         {
-            QString message = QString::fromUtf8(payload);
-            ui->plainTextEdit->appendPlainText(peer_ip + ": " + message + "\n");
+            const QString message = QString::fromUtf8(payload);
+            ui->plainTextEdit->appendPlainText(m_peerIp + ": " + message + "\n");
             break;
         }
         default:
@@ -220,8 +215,8 @@ void ChatDialog::slotReadSocket()
     }
 }
 
-KeyPressEater::KeyPressEater(QWidget *parent):
-    QObject(parent)
+KeyPressEater::KeyPressEater(QWidget *parent)
+    : QObject(parent)
 {
 }
 
@@ -229,7 +224,7 @@ bool KeyPressEater::eventFilter(QObject *obj, QEvent *event)
 {
     if (event->type() == QEvent::KeyPress)
     {
-        QKeyEvent *keyEvent = static_cast<QKeyEvent *>(event);
+        const QKeyEvent *keyEvent = static_cast<QKeyEvent *>(event);
 
         if (keyEvent->key() == Qt::Key_Return || keyEvent->key() == Qt::Key_Enter)
         {
